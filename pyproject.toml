@@ -22,3 +22,6 @@ build-backend = "setuptools.build_meta"
 dev = [
     "pre-commit>=3.5.0",
 ]
+
+[project.scripts]
+dcube = "dcube_conv.app.dcube_convert:main"
