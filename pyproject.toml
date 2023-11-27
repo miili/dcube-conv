@@ -2,26 +2,26 @@
 name = "dcube-conv"
 version = "0.1.0"
 description = "Convert Datacube to MiniSeed and StationXML"
-authors = [
-    {name = "Marius Isken", email = "marius.isken@gfz-potsdam.de"},
-]
+authors = [{ name = "Marius Isken", email = "marius.isken@gfz-potsdam.de" }]
 dependencies = [
     "pydantic>=2.5.2",
     "rich>=13.7.0",
     "pyrocko>=2023.10.11",
+    "fiona>=1.9",
 ]
 requires-python = ">=3.11"
 readme = "README.md"
-license = {text = "MIT"}
+license = { text = "MIT" }
 
 [build-system]
 requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.pdm.dev-dependencies]
-dev = [
-    "pre-commit>=3.5.0",
-]
+dev = ["pre-commit>=3.5.0"]
+
+[tool.ruff]
+extend-select = ['W', 'N', 'DTZ', 'RET', 'SIM', 'B', 'RET', 'C4', 'I', 'RUF']
 
 [project.scripts]
 dcube = "dcube_conv.app.dcube_convert:main"
