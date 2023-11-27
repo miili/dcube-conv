@@ -30,8 +30,10 @@ MB = 1_000_000
 
 class LoadingStats(Stats):
     n_files: int = 0
+    i_files: int = 0
     size_bytes_total: int = 0
     bytes_loaded: int = 0
+    cube_ids: set[str] = Field(default_factory=set)
     time_started: datetime = Field(default_factory=datetime.now)
 
     _queue: asyncio.Queue | None = PrivateAttr(default=None)
@@ -62,7 +64,6 @@ class LoadingStats(Stats):
     @property
     def loading_rate(self) -> float:
         if self.bytes_loaded == 0.0:
-            self.reset_time()
             return 0.0
         return self.bytes_loaded / self.time_elapsed.total_seconds()
 
@@ -84,24 +85,32 @@ class LoadingStats(Stats):
         self.time_started = datetime.now()  # noqa DTZ005
 
     def _populate_table(self, table: Table) -> None:
+        def format_timedelta(td: timedelta) -> str:
+            return str(td).split(".")[0]
+
+        def format_bytes(b: int) -> str:
+            return ByteSize(b).human_readable(decimal=True)
+
         table.add_row(
             "Progress",
-            f"[bold]{self.processed_percent:.1f}%[/bold]"
-            f" ({ByteSize(self.bytes_loaded).human_readable(decimal=True)}"
-            f"/{ByteSize(self.size_bytes_total).human_readable(decimal=True)})",
+            f"[bold]{self.processed_percent:.1f}%[/bold]",
+            f"({self.i_files} / {self.n_files})",
         )
         table.add_row(
-            "Loading rate",
-            f"{ByteSize(self.loading_rate).human_readable()}/s",
+            "Processing rate",
+            f"{format_bytes(self.loading_rate)}/s",
+            f"({format_bytes(self.bytes_loaded)}"
+            f" / {format_bytes(self.size_bytes_total)})",
         )
-        table.add_row("Remaining time", str(self.time_remaining))
-        table.add_row("Queue", f"{self.queue_size}/{self.queue_maxsize}")
+        table.add_row("Remaining time", format_timedelta(self.time_remaining))
+        table.add_row("Queue", f"{self.queue_size} / {self.queue_maxsize}")
+        table.add_row("Cube IDs", str(len(self.cube_ids)))
 
 
 class DataCubeLoader(BaseModel):
     directories: list[DirectoryPath] = [DirectoryPath(".")]
     min_file_size: ByteSize = ByteSize(15 * MB)
-    queue_size: PositiveInt = 20
+    queue_size: PositiveInt = 16
 
     start_time: AwareDatetime | None = None
     end_time: AwareDatetime | None = None
@@ -109,7 +118,8 @@ class DataCubeLoader(BaseModel):
     cube_ids: set[CubeId] = set()
 
     _stats: LoadingStats = PrivateAttr(default_factory=LoadingStats)
-    _files: list[Path] = PrivateAttr(default_factory=list)
+    _files: set[Path] = PrivateAttr(default_factory=set)
+    _filenames: set[str] = PrivateAttr(default_factory=set)
     _cube_ids: list[CubeId] = PrivateAttr(default_factory=list)
 
     _progress_file: Path | None = PrivateAttr(default=None)
@@ -124,32 +134,37 @@ class DataCubeLoader(BaseModel):
                     continue
                 if file in self._done_paths:
                     continue
-
-                file_stats = file.stat()
-                if file_stats.st_size < self.min_file_size:
-                    continue
-                if (
-                    self.start_time
-                    and file_stats.st_mtime < self.start_time.timestamp()
-                ):
-                    continue
-                if self.end_time and file_stats.st_mtime > self.end_time.timestamp():
+                if file.name in self._filenames:
+                    logger.warning("Duplicate file %s", file)
                     continue
 
+                stat = file.stat()
+                if stat.st_size < self.min_file_size:
+                    continue
+                if self.start_time and stat.st_mtime < self.start_time.timestamp():
+                    continue
+                if self.end_time and stat.st_mtime > self.end_time.timestamp():
+                    continue
                 with file.open("rb") as f:
                     if not datacube.detect(f.read(512)):
                         continue
+
+                self._filenames.add(file.name)
                 yield file
-                await asyncio.sleep(0)
+                await asyncio.sleep(0)  # Yield to event loop
 
     async def prepare(self) -> None:
         async for file in self._scan_datacube_files():
+            cube_id = file.suffix.lstrip(".").upper()
+            self._cube_ids.append(cube_id)
+            self._files.add(file)
+
+            self._stats.cube_ids.add(cube_id)
             self._stats.n_files += 1
             self._stats.size_bytes_total += file.stat().st_size
-            self._files.append(file)
-            self._cube_ids.append(file.stem.lstrip("."))
+
         logger.info(
-            "Found %d datacube files (%s/s)",
+            "Found %d datacube files, total %s",
             self._stats.n_files,
             ByteSize(self._stats.size_bytes_total).human_readable(decimal=True),
         )
@@ -170,10 +185,14 @@ class DataCubeLoader(BaseModel):
     async def iter_datacubes(self) -> AsyncIterator[CubeTraces]:
         queue = asyncio.Queue(maxsize=self.queue_size)
         self._stats.set_queue(queue)
+        self._stats.reset_time()
         iterator = iter(self)
 
         async def worker(file: Path) -> None:
-            await queue.put(await asyncio.to_thread(CubeTraces.from_file, file))
+            cube = await asyncio.to_thread(CubeTraces.from_file, file)
+            if cube is None:
+                return
+            await queue.put(cube)
             self._stats.bytes_loaded += file.stat().st_size
 
         async def fetch(task_group: asyncio.TaskGroup, n_files: int = 1) -> None:
@@ -193,6 +212,7 @@ class DataCubeLoader(BaseModel):
                 if cube is None:
                     break
                 yield cube
+                self._stats.i_files += 1
                 queue.task_done()
                 tg.create_task(fetch(tg, n_files=1))
 

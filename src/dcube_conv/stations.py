@@ -26,13 +26,13 @@ logger = logging.getLogger(__name__)
 class SiteStats(Stats):
     n_sites: int = 0
     n_stations: int = 0
-    n_locations: int = 0
     n_no_site: int = 0
 
     def _populate_table(self, table: Table) -> None:
         table.add_row("Sites", str(self.n_sites))
-        table.add_row("Mapped Stations", str(self.n_stations))
-        table.add_row("No site info", str(self.n_no_site))
+        table.add_row("Sites not found", f"[red]{self.n_no_site}")
+        table.add_row("Stations", str(self.n_stations))
+        table.add_row("Stations not found", f"[red]{self.n_sites - self.n_stations}")
 
 
 class CubeSite(Location):
@@ -91,6 +91,8 @@ class CubeSites(BaseModel):
     sites: DefaultDict[CubeId, list[CubeSite]] = Field(default_factory=defaultdict)
     mapper: StationMapper | None = Field(default_factory=StationMapper)
 
+    no_site_info: set[CubeId] = Field(default_factory=set)
+
     _dump_path: Path | None = PrivateAttr(None)
     _stats: SiteStats = PrivateAttr(default_factory=SiteStats)
 
@@ -130,6 +132,7 @@ class CubeSites(BaseModel):
             datacube.start_time,
         )
         self._stats.n_no_site += 1
+        self.no_site_info.add(datacube.cube_id)
         return None
 
     def iter_sites(self) -> Iterator[CubeSite]:
@@ -167,7 +170,9 @@ class CubeSites(BaseModel):
     def dump_csv(self, file: Path) -> None:
         logger.debug("Dumping CSV stations to %s", file)
         with file.open("w") as f:
-            f.write("cube_id,location,lat,lon,elevation,depth,start_time,station\n")
+            f.write(
+                "cube_id,location,lat,lon,elevation,depth,start_time,station_name\n"
+            )
             for site in self.iter_sites():
                 f.write(
                     f"{site.cube_id},{site.location},{site.lat},{site.lon},"

@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator, Self
 
@@ -54,6 +56,12 @@ class Converter(BaseModel):
                 tg.create_task(worker(dc))
 
     async def convert(self) -> None:
+        loop = asyncio.get_running_loop()
+        cpu_count = int(os.environ.get("SLURM_CPUS_PER_TASK", 0))
+        cpu_count = cpu_count or os.cpu_count() or 8
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=cpu_count))
+        logger.info("Using %d threads", cpu_count)
+
         live = asyncio.create_task(RuntimeStats.live_view())
         await self.loader.prepare()
         await self.stations.prepare()
@@ -65,6 +73,11 @@ class Converter(BaseModel):
     @classmethod
     def load(cls, file: Path) -> Self:
         converter = cls.model_validate_json(file.read_bytes())
-        converter.stations._dump_path = file.with_name(f"{file.stem}.stations.json")
+
+        station_file = file.with_name(f"{file.stem}.stations.json")
+        if station_file.exists():
+            converter.stations = CubeSites.model_validate_json(station_file.read_text())
+        converter.stations._dump_path = station_file
+
         converter.loader.set_progress_file(file.with_name(f"{file.stem}.progress"))
         return converter

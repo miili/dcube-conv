@@ -25,6 +25,7 @@ ChannelMapping = dict[ChannelID, ChannelID]
 class Station(Location):
     name: str
     seismic_sensor: str
+    location: str = ""
 
     _parent: StationMapper | None = PrivateAttr(None)
 
@@ -45,6 +46,7 @@ class Station(Location):
             depth=feature["properties"].get("depth", 0.0),
             name=feature["properties"]["station_name"],
             seismic_sensor=feature["properties"]["seismic_sensor"],
+            location=feature["properties"].get("location", "") or "",
         )
 
 

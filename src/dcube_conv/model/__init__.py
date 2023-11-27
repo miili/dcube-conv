@@ -28,7 +28,7 @@ class CubeTraces:
     @computed_field
     @property
     def cube_id(self) -> CubeId:
-        return self.path.suffix.lstrip(".")
+        return self.path.suffix.lstrip(".").upper()
 
     @computed_field
     @property
@@ -41,9 +41,13 @@ class CubeTraces:
         return float(1.0 / self.traces[0].deltat)
 
     @classmethod
-    def from_file(cls, file: Path) -> Self:
+    def from_file(cls, file: Path) -> Self | None:
         logger.debug("Loading %s", file)
-        data = list(datacube.iload(str(file), yield_gps_tags=True))
+        try:
+            data = list(datacube.iload(str(file), yield_gps_tags=True))
+        except Exception as e:
+            logger.error("Failed to load %s: %s", file, e)
+            return None
         gps_tags = data[0][1]
         return cls(path=file, traces=[tr for (tr, _) in data], gps_tags=gps_tags)
 

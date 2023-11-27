@@ -58,14 +58,14 @@ def main():
         help="Create a StationXML file from a DCube convert project",
     )
     xml_create.add_argument(
-        "input_stations",
-        type=Path,
-        help="Path to -station.json file.",
-    )
-    xml_create.add_argument(
         "input_config",
         type=Path,
         help="Path to generated config file.",
+    )
+    xml_create.add_argument(
+        "input_stations",
+        type=Path,
+        help="Path to <run>.station.json file.",
     )
     args = parser.parse_args()
 
