@@ -7,19 +7,31 @@ from typing import TYPE_CHECKING, AsyncIterator, Self
 
 from pydantic import (
     BaseModel,
+    ByteSize,
     DirectoryPath,
     PositiveInt,
+    PrivateAttr,
 )
+from rich.table import Table
 
 from dcube_conv.loader import DataCubeLoader
 from dcube_conv.model import CubeTraces, RecordLength, SteimCompression
 from dcube_conv.stations import CubeSites
-from dcube_conv.stats import RuntimeStats
+from dcube_conv.stats import RuntimeStats, Stats
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+class ConverterStats(Stats):
+    bytes_written: int = 0
+
+    def _populate_table(self, table: Table) -> None:
+        table.add_row(
+            "Bytes written", ByteSize(self.bytes_written).human_readable(decimal=True)
+        )
 
 
 class Converter(BaseModel):
@@ -38,22 +50,26 @@ class Converter(BaseModel):
 
     write_threads: PositiveInt = 20
 
+    _stats = PrivateAttr(default_factory=ConverterStats)
+
     async def _async_save(self, datacube_traces: AsyncIterator[CubeTraces]) -> None:
-        limit = asyncio.Semaphore(self.write_threads)
+        limit = asyncio.Semaphore(self.write_threads + 1)
 
         async def worker(cube: CubeTraces) -> None:
             async with limit:
-                await asyncio.to_thread(
+                bytes = await asyncio.to_thread(
                     cube.save,
                     self.output_path / self.output_template,
                     record_length=self.record_length,
                     steim=self.steim_compression,
                 )
+                self._stats.bytes_written += bytes
                 self.loader.add_done(cube)
 
         async with asyncio.TaskGroup() as tg:
             async for dc in datacube_traces:
-                tg.create_task(worker(dc))
+                async with limit:
+                    tg.create_task(worker(dc))
 
     async def convert(self) -> None:
         loop = asyncio.get_running_loop()

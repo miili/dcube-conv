@@ -3,6 +3,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from rich import print_json
 from rich.logging import RichHandler
 
 FORMAT = "%(message)s"
@@ -89,13 +90,13 @@ def main():
     elif args.command == "init":
         from dcube_conv.convert import Converter
 
-        print(Converter().model_dump_json(indent=2))
+        print_json(Converter().model_dump_json(indent=2))
 
     elif args.command == "stationxml":
         if args.xml_command == "init":
             from dcube_conv.stationxml import StationXML
 
-            print(StationXML().model_dump_json(indent=2))
+            print_json(StationXML().model_dump_json(indent=2))
         elif args.xml_command == "create":
             from dcube_conv.stations import CubeSites
             from dcube_conv.stationxml import StationXML

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 import fiona
-from pydantic import BaseModel, FilePath, PositiveFloat, PrivateAttr
+from pydantic import BaseModel, Field, FilePath, PositiveFloat, PrivateAttr
 
 from dcube_conv.model import Location
 
@@ -25,7 +25,7 @@ ChannelMapping = dict[ChannelID, ChannelID]
 class Station(Location):
     name: str
     seismic_sensor: str
-    location: str = ""
+    location: str = Field(default="", max_length=3)
 
     _parent: StationMapper | None = PrivateAttr(None)
 

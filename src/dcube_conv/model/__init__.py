@@ -37,6 +37,11 @@ class CubeTraces:
 
     @computed_field
     @property
+    def end_time(self) -> datetime:
+        return datetime.fromtimestamp(float(self.traces[0].tmax), tz=timezone.utc)
+
+    @computed_field
+    @property
     def sampling_rate(self) -> float:
         return float(1.0 / self.traces[0].deltat)
 
@@ -63,15 +68,16 @@ class CubeTraces:
         self,
         output_path: Path,
         record_length: RecordLength = 4096,
-        steim: SteimCompression = 1,
-    ) -> None:
-        save(
+        steim: SteimCompression = 2,
+    ) -> int:
+        files = save(
             self.traces,
             str(output_path),
             record_length=record_length,
             steim=steim,
             append=True,
         )
+        return sum(Path(f).stat().st_size for f in files)
 
 
 class Location(BaseModel):
@@ -111,7 +117,11 @@ class Location(BaseModel):
 
         return math.sqrt((sx - ox) ** 2 + (sy - oy) ** 2 + (sz - oz) ** 2)
 
-    def is_close(self, other: Location, distance_threshold: float = 25.0) -> bool:
+    def is_close(
+        self,
+        other: Location,
+        distance_threshold_meters: float = 25.0,
+    ) -> bool:
         """Check if two stations are close to each other.
 
         Args:
@@ -122,4 +132,4 @@ class Location(BaseModel):
         Returns:
             bool: True if close, False otherwise.
         """
-        return self.distance_to(other) < distance_threshold
+        return self.surface_distance_to(other) < distance_threshold_meters
