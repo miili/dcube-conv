@@ -14,9 +14,10 @@ from pyrocko.model import Station as PyrockoStation
 from pyrocko.model import dump_stations_yaml
 
 from dcube_conv.model import CubeId, CubeTraces, Location
-from dcube_conv.station_mapper import Station, StationMapper
+from dcube_conv.processors import ProcessorType
+from dcube_conv.station_mapper import SensorID, Station, StationMapper
 from dcube_conv.stats import Stats
-from dcube_conv.utils import ElevationModel, get_elevation
+from dcube_conv.utils import DATETIME_MAX, ElevationModel, get_elevation
 
 if TYPE_CHECKING:
     from rich.table import Table
@@ -40,10 +41,9 @@ class CubeSite(Location):
     location: str = ""
     cube_id: str
     sampling_rate: PositiveFloat
-    channel_map: dict[str, str] = Field(default_factory=dict)
 
     start_time: datetime
-    end_time: datetime | None = None
+    end_time: datetime
 
     station: Station | None = None
 
@@ -53,7 +53,6 @@ class CubeSite(Location):
 
     def set_station(self, station: Station) -> None:
         self.station = station
-        self.channel_map = station.get_channel_map()
 
     @classmethod
     async def from_datacube_trace(cls, datacube: CubeTraces) -> CubeSite | None:
@@ -103,6 +102,9 @@ class CubeSites(BaseModel):
     sites: DefaultDict[CubeId, list[CubeSite]] = Field(default_factory=defaultdict)
     elevation_model: ElevationModel = Field(default="aster30m")
 
+    post_processors: dict[SensorID, list[ProcessorType]] = {}
+    station_blacklist: set[str] = Field(default_factory=set)
+
     mapper: StationMapper | None = Field(default_factory=StationMapper)
     no_site_info: set[CubeId] = Field(default_factory=set)
 
@@ -110,17 +112,32 @@ class CubeSites(BaseModel):
     _stats: SitesStats = PrivateAttr(default_factory=SitesStats)
 
     async def prepare(self) -> None:
+        logger.info("Preparing CubeSites")
         if self.mapper:
             self.mapper.prepare()
+
+    @property
+    def n_sites(self) -> int:
+        return sum(len(sites) for sites in self.sites.values())
+
+    @property
+    def n_cubes(self) -> int:
+        return len(self.sites)
 
     def add_site(self, site: CubeSite) -> None:
         existing_sites = self.sites.get(site.cube_id, [])
 
         for existing_site in existing_sites:
             if existing_site.is_close(site):
-                if existing_site.start_time > site.start_time:
-                    existing_site.start_time = site.start_time
-                    self.save()
+                existing_site.start_time = min(
+                    site.start_time,
+                    existing_site.start_time,
+                )
+                existing_site.end_time = max(
+                    site.end_time,
+                    existing_site.end_time,
+                )
+                self.save()
                 return
 
         if self.mapper:
@@ -137,7 +154,7 @@ class CubeSites(BaseModel):
     def get_site(self, datacube: CubeTraces) -> CubeSite | None:
         if sites := self.sites.get(datacube.cube_id, None):
             for site in sorted(sites, key=lambda s: s.start_time, reverse=True):
-                if site.start_time <= datacube.start_time:
+                if site.start_time <= datacube.start_time <= site.end_time:
                     return site
         logging.error(
             "No site found for %s, %s",
@@ -153,33 +170,89 @@ class CubeSites(BaseModel):
             for site in sites:
                 yield site
 
-    def fill_endtimes(self, end_time: datetime = datetime.max) -> None:
+    def iter_stations(self) -> Iterator[CubeSite]:
+        sites = {}
+
+        for site in self.iter_sites():
+            if site.station is None:
+                logger.warning(
+                    "Skipping: No station for cube %s (%f, %f)",
+                    site.cube_id,
+                    site.lat,
+                    site.lon,
+                )
+                continue
+
+            if site.station_name not in sites:
+                sites[site.station_name] = site
+                continue
+
+            existing_site = sites[site.station_name]
+            if site.distance_to(existing_site) > 25.0:
+                logger.warning(
+                    "Site %s is more than 25 m away from existing site %s",
+                    site,
+                    existing_site,
+                )
+                continue
+            existing_site.start_time = min(existing_site.start_time, site.start_time)
+            existing_site.end_time = max(existing_site.end_time, site.end_time)
+
+        yield from sites.values()
+
+    def fill_endtimes(self, end_time: datetime = DATETIME_MAX) -> None:
+        logger.info("Filling end times of sites")
         for sites in self.sites.values():
-            for i_site, site in enumerate(sorted(sites, key=lambda s: s.start_time)):
-                if i_site + 1 < len(sites):
-                    site.end_time = sites[i_site + 1].start_time
+            sorted_sites = sorted(sites, key=lambda s: s.start_time)
+            for i_site, site in enumerate(sorted_sites):
+                if site.end_time:
+                    continue
+                if i_site + 1 < len(sorted_sites):
+                    site.end_time = sorted_sites[i_site + 1].start_time
                 else:
                     site.end_time = end_time
+
+    async def post_process_datacube(
+        self,
+        cube: CubeTraces,
+        site: CubeSite,
+    ) -> CubeTraces:
+        if site.station_name and site.station_name not in self.post_processors:
+            return cube
+
+        for processor in self.post_processors[site.station_name]:
+            cube = await processor.process(cube)
+
+        return cube
 
     async def process_datacubes(
         self,
         cubes: AsyncIterator[CubeTraces],
     ) -> AsyncIterator[CubeTraces]:
-        async for cube in cubes:
-            new_site = await CubeSite.from_datacube_trace(cube)
-            if new_site:
-                self.add_site(new_site)
-            site = self.get_site(cube)
-            if site:
-                cube.set_nsl(self.network, site.station_name, site.location)
-                for old, new in site.channel_map.items():
-                    cube.rename_channels(old, new)
+        logger.info("Processing datacubes")
+        try:
+            async for cube in cubes:
+                new_site = await CubeSite.from_datacube_trace(cube)
+                if new_site:
+                    self.add_site(new_site)
+                site = self.get_site(cube)
+                if site:
+                    cube.set_nsl(self.network, site.station_name, site.location)
+                    if site.station:
+                        if site.station_name in self.station_blacklist:
+                            logger.info(
+                                "Skipping blacklisted station %s", site.station_name
+                            )
+                            continue
+                        for old, new in site.station.get_channel_map().items():
+                            cube.rename_channels(old, new)
+                        await self.post_process_datacube(cube, site)
 
-            yield cube
+                yield cube
 
-        self.fill_endtimes()
-        self.save()
-        # TODO Fill in missing elevations!
+            self.fill_endtimes()
+        finally:
+            self.save()
 
     def dump_csv(self, file: Path) -> None:
         logger.debug("Dumping CSV stations to %s", file)
@@ -208,3 +281,28 @@ class CubeSites(BaseModel):
             self.dump_pyrocko_yaml(self._dump_path.with_suffix(".yaml"))
         else:
             logger.warning("No dump path set, not saving.")
+
+    async def fill_elevations(self) -> None:
+        """Fill missing elevations by querying them from online service."""
+        logger.info("Filling missing elevations")
+        for site in self.iter_sites():
+            if not site.has_valid_elevation():
+                await site.query_elevation(self.elevation_model)
+        self.save()
+
+    @classmethod
+    def load(cls, file: Path):
+        sites = cls.model_validate_json(file.read_bytes())
+        sites._dump_path = file
+        logger.info(
+            "loaded %d sites and %d cubes from %s",
+            sites.n_sites,
+            sites.n_cubes,
+            file,
+        )
+
+        for site in sites.iter_sites():
+            if site.station and sites.mapper:
+                site.station.set_parent(sites.mapper)
+
+        return sites

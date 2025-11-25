@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 import aiohttp
+from pydantic import ByteSize
 
 
 def datetime_now() -> datetime:
@@ -26,6 +27,8 @@ ElevationModel = Literal[
 ]
 
 LAST_REQUEST = datetime_now()
+
+DATETIME_MAX = datetime.max.replace(tzinfo=timezone.utc)
 
 
 async def get_elevation(
@@ -64,3 +67,7 @@ async def get_elevation(
         LAST_REQUEST = datetime_now()
         data = await response.json()
         return data["results"][0]["elevation"]
+
+
+def format_bytes(b: int | float) -> str:
+    return ByteSize(b).human_readable(decimal=True)

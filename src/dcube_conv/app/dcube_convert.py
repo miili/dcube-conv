@@ -58,6 +58,14 @@ def main():
         "create",
         help="Create a StationXML file from a DCube convert project",
     )
+
+    xml_create.add_argument(
+        "--fill-elevations",
+        action="store_true",
+        help="Fill elevations from online data.",
+        default=False,
+    )
+
     xml_create.add_argument(
         "input_config",
         type=Path,
@@ -68,15 +76,28 @@ def main():
         type=Path,
         help="Path to <run>.station.json file.",
     )
+
+    plot = subparsers.add_parser(
+        "plot",
+        help="Plot station coverage",
+    )
+    plot.add_argument(
+        "input_path",
+        type=Path,
+        help="Path to <run>.station.json file.",
+    )
+
     args = parser.parse_args()
 
-    logging.basicConfig(
+    logging.root.setLevel(
         level=logging.DEBUG
         if args.v >= 2
         else logging.INFO
         if args.v >= 1
         else logging.WARNING
     )
+
+    loop_debug = bool(args.v)
 
     if args.command == "convert":
         from dcube_conv.convert import Converter
@@ -85,7 +106,7 @@ def main():
 
         file_logger = logging.FileHandler(args.input_path.with_suffix(".log"))
         logging.root.addHandler(file_logger)
-        asyncio.run(converter.convert())
+        asyncio.run(converter.convert(), debug=loop_debug)
 
     elif args.command == "init":
         from dcube_conv.convert import Converter
@@ -101,9 +122,18 @@ def main():
             from dcube_conv.stations import CubeSites
             from dcube_conv.stationxml import StationXML
 
-            sites = CubeSites.model_validate_json(args.input_stations.read_bytes())
+            sites = CubeSites.load(args.input_stations)
+            if args.fill_elevations:
+                asyncio.run(sites.fill_elevations())
             stationxml = StationXML.model_validate_json(args.input_config.read_bytes())
             stationxml.dump_stationxml(sites, args.input_config.with_suffix(".xml"))
+
+    elif args.command == "plot":
+        from dcube_conv.plot import plot_cube_coverage
+        from dcube_conv.stations import CubeSites
+
+        sites = CubeSites.load(args.input_path)
+        plot_cube_coverage(sites)
 
     else:
         parser.print_help()

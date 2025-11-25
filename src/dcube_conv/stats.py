@@ -46,7 +46,7 @@ class RuntimeStats(BaseModel):
                 )
                 table.add_section()
                 stats._populate_table(table)
-            return Group(Panel(table, title="Datacube Raid"))
+            return Group(Panel(table, title="DataCube Raid"))
 
         with Live(
             generate_grid(),
@@ -67,5 +67,4 @@ class Stats(BaseModel):
     def model_post_init(self, __context: Any) -> None:
         STATS_INSTANCES[self.__class__.__name__] = self
 
-    def _populate_table(self, table: Table) -> None:
-        ...
+    def _populate_table(self, table: Table) -> None: ...

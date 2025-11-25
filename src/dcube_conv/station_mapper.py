@@ -20,6 +20,29 @@ SensorID = str
 ChannelID = str
 
 ChannelMapping = dict[ChannelID, ChannelID]
+DegreeFromNorth = float
+
+
+DIP_MAP = {
+    "N": 0.0,
+    "E": 0.0,
+    "Z": -90.0,
+    "1": 0.0,
+    "2": 0.0,
+}
+
+AZIMUTH_MAP = {
+    "N": 0.0,
+    "E": 90.0,
+    "Z": 0.0,
+    "1": 0.0,
+    "2": 90.0,
+}
+
+
+class StationOrientationOverwrite(BaseModel):
+    dip: float = 0.0
+    azimuth: float = 0.0
 
 
 class Station(Location):
@@ -34,8 +57,23 @@ class Station(Location):
 
     def get_channel_map(self) -> ChannelMapping:
         if not self._parent:
-            raise RuntimeError("Station has no parent.")
-        return self._parent.channel_map[self.seismic_sensor]
+            raise RuntimeError(f"Station {self.name} has no parent.")
+        return self._parent.get_channel_map(self.seismic_sensor, self.name)
+
+    def get_channel_dip(self, channel: str) -> PositiveFloat:
+        if not self._parent:
+            raise RuntimeError(f"Station {self.name} has no parent.")
+        return self._parent.get_channel_dip(self.seismic_sensor, self.name, channel)
+
+    def get_channel_azimuth(self, channel: str) -> PositiveFloat:
+        if not self._parent:
+            raise RuntimeError(f"Station {self.name} has no parent.")
+        return self._parent.get_channel_azimuth(self.seismic_sensor, self.name, channel)
+
+    def has_orientation_overwrite(self) -> bool:
+        if not self._parent:
+            raise RuntimeError(f"Station {self.name} has no parent.")
+        return self._parent.has_orientation_overwrite(self.name)
 
     @classmethod
     def from_feature(cls, feature: dict[str, Any]) -> Self:
@@ -46,7 +84,7 @@ class Station(Location):
             depth=feature["properties"].get("depth", 0.0),
             name=feature["properties"]["station_name"],
             seismic_sensor=feature["properties"]["seismic_sensor"],
-            location=feature["properties"].get("location", "") or "",
+            # location=feature["properties"].get("location", "") or "",
         )
 
 
@@ -70,14 +108,49 @@ class StationMapper(BaseModel):
             "p2": "HHE",
         },
     }
+    station_orientation_overwrites: dict[str, StationOrientationOverwrite] = {}
 
     _features: list[Station] = PrivateAttr([])
+
+    def get_channel_map(self, sensor: SensorID, station: str) -> ChannelMapping:
+        sensor_map = self.channel_map[sensor].copy()
+        if station in self.station_orientation_overwrites:
+            for in_channel, out_channel in sensor_map.items():
+                if out_channel.endswith("N"):
+                    out_channel = f"{out_channel[:-1]}1"
+                elif out_channel.endswith("E"):
+                    out_channel = f"{out_channel[:-1]}2"
+                sensor_map[in_channel] = out_channel
+        return sensor_map
+
+    def get_channel_azimuth(
+        self, sensor: SensorID, station: str, channel: str
+    ) -> float:
+        try:
+            azimuth = AZIMUTH_MAP[channel[-1]]
+        except KeyError as exc:
+            raise ValueError(f"Unknown channel azimuth: {channel}") from exc
+        if station in self.station_orientation_overwrites and not channel.endswith("Z"):
+            overwrite = self.station_orientation_overwrites[station]
+            azimuth += overwrite.azimuth
+
+        return (azimuth + 360.0) % 360.0
+
+    def has_orientation_overwrite(self, station: str) -> bool:
+        return station in self.station_orientation_overwrites
+
+    def get_channel_dip(self, sensor: SensorID, station: str, channel: str) -> float:
+        try:
+            return DIP_MAP[channel[-1]]
+        except KeyError as exc:
+            raise ValueError(f"Unknown channel dip: {channel}") from exc
 
     def prepare(self):
         check_geopackage(self.geopackage)
         self.load_geopackage(self.geopackage)
 
     def load_geopackage(self, file: Path) -> None:
+        logger.info("Loading geopackage %s", file)
         with fiona.open(file) as data:
             for feature in data:
                 station = Station.from_feature(feature)
@@ -89,7 +162,10 @@ class StationMapper(BaseModel):
         min_distance = min(distances)
         if min_distance > self.distance_threshold:
             return None
-        return self._features[distances.index(min_distance)]
+
+        station = self._features[distances.index(min_distance)]
+        station.set_parent(self)
+        return station
 
 
 def check_geopackage(file: Path) -> bool:

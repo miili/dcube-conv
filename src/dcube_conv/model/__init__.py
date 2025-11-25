@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import warnings
+from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Self
 
 import pyrocko.orthodrome as od
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel
 from pyrocko.io import datacube, save
 from pyrocko.trace import Trace
 
@@ -19,28 +22,36 @@ RecordLength = Literal[512, 1024, 2048, 4096, 8192]
 CubeId = str
 
 
+# warnings.filterwarnings("error", message="Extrapolating GPS time information")
+warnings.filterwarnings("error", message="No usable GPS timestamps found.")
+# warnings.filterwarnings("error", message="Small number of GPS tags found.")
+
+
+WRITE_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def get_lock(cube_id: str) -> asyncio.Lock:
+    return WRITE_LOCKS[cube_id]
+
+
 @dataclass
 class CubeTraces:
     path: Path
     traces: list[Trace]
     gps_tags: Any
 
-    @computed_field
     @property
     def cube_id(self) -> CubeId:
         return self.path.suffix.lstrip(".").upper()
 
-    @computed_field
     @property
     def start_time(self) -> datetime:
         return datetime.fromtimestamp(float(self.traces[0].tmin), tz=timezone.utc)
 
-    @computed_field
     @property
     def end_time(self) -> datetime:
         return datetime.fromtimestamp(float(self.traces[0].tmax), tz=timezone.utc)
 
-    @computed_field
     @property
     def sampling_rate(self) -> float:
         return float(1.0 / self.traces[0].deltat)
@@ -50,8 +61,8 @@ class CubeTraces:
         logger.debug("Loading %s", file)
         try:
             data = list(datacube.iload(str(file), yield_gps_tags=True))
-        except Exception as e:
-            logger.error("Failed to load %s: %s", file, e)
+        except (Warning, Exception) as warn:
+            logger.warning("Failed to load %s: %s", file, warn)
             return None
         gps_tags = data[0][1]
         return cls(path=file, traces=[tr for (tr, _) in data], gps_tags=gps_tags)
@@ -64,19 +75,29 @@ class CubeTraces:
         for trace in [tr for tr in self.traces if tr.channel == old]:
             trace.set_channel(new)
 
-    def save(
+    async def save(
         self,
         output_path: Path,
         record_length: RecordLength = 4096,
         steim: SteimCompression = 2,
     ) -> int:
-        files = save(
-            self.traces,
-            str(output_path),
-            record_length=record_length,
-            steim=steim,
-            append=True,
+        tr_tmin = datetime.fromtimestamp(
+            min(tr.tmin for tr in self.traces),
+            tz=timezone.utc,
         )
+        # Some traces have a tmin that is just before midnight
+        tr_julianday = (tr_tmin + timedelta(seconds=10.0)).timetuple().tm_yday
+
+        async with get_lock(self.cube_id):
+            files = await asyncio.to_thread(
+                save,
+                self.traces,
+                str(output_path),
+                additional={"julianday": tr_julianday},
+                record_length=record_length,
+                steim=steim,
+                append=True,
+            )
         return sum(Path(f).stat().st_size for f in files)
 
 
