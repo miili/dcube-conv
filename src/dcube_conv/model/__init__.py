@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Self
+from weakref import WeakValueDictionary
 
 import pyrocko.orthodrome as od
 from pydantic import BaseModel
@@ -25,11 +26,15 @@ RecordLength = Literal[512, 1024, 2048, 4096, 8192]
 CubeId = str
 
 
-WRITE_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Locks are dropped once no writer holds or waits for them.
+WRITE_LOCKS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
 
-def get_lock(cube_id: str) -> asyncio.Lock:
-    return WRITE_LOCKS[cube_id]
+def get_lock(file: str) -> asyncio.Lock:
+    lock = WRITE_LOCKS.get(file)
+    if lock is None:
+        lock = WRITE_LOCKS[file] = asyncio.Lock()
+    return lock
 
 
 @dataclass
@@ -93,18 +98,27 @@ class CubeTraces:
         tr_tmid = tr_tmin + (tr_max - tr_tmin) / 2
         loop = asyncio.get_running_loop()
 
+        additional = {"julian_day": f"{tr_tmid.timetuple().tm_yday:03d}"}
+        files = sorted(
+            {tr.fill_template(str(output_path), **additional) for tr in self.traces}
+        )
+
         func_call = partial(
             save,
             self.traces,
             str(output_path),
-            additional={"julian_day": f"{tr_tmid.timetuple().tm_yday:03d}"},
+            additional=additional,
             record_length=record_length,
             steim=steim,
             append=True,
         )
 
-        async with get_lock(self.cube_id):
-            files = await loop.run_in_executor(executor, func_call)
+        async with AsyncExitStack() as stack:
+            # Appends to the same file must not interleave. Locking in sorted
+            # order keeps cubes sharing several files from deadlocking.
+            for file in files:
+                await stack.enter_async_context(get_lock(file))
+            await loop.run_in_executor(executor, func_call)
 
         return sum(Path(f).stat().st_size for f in files)
 
