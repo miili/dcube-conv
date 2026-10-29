@@ -77,19 +77,25 @@ class Converter(BaseModel):
 
     async def _async_save(self, datacube_traces: AsyncIterator[CubeTraces]) -> None:
         executor = ThreadPoolExecutor(max_workers=self.write_threads)
+        # Bounds the cubes held in memory, the loader queue then backs up.
+        slots = asyncio.Semaphore(self.write_threads)
 
         async def worker(cube: CubeTraces) -> None:
-            nbytes = await cube.save(
-                self.output_path / self.output_template,
-                record_length=self.record_length,
-                steim=self.steim_compression,
-                executor=executor,
-            )
-            self._stats.add_bytes(nbytes)
-            self.loader.add_done(cube)
+            try:
+                nbytes = await cube.save(
+                    self.output_path / self.output_template,
+                    record_length=self.record_length,
+                    steim=self.steim_compression,
+                    executor=executor,
+                )
+                self._stats.add_bytes(nbytes)
+                self.loader.add_done(cube)
+            finally:
+                slots.release()
 
         tasks = []
         async for cube in datacube_traces:
+            await slots.acquire()
             task = asyncio.create_task(worker(cube))
             tasks.append(task)
             task.add_done_callback(lambda t: tasks.remove(t))

@@ -21,13 +21,14 @@ DAY = 86400.0
 def make_cube(
     cube_id: str,
     tmin: float,
+    station: str = "STA",
     nsamples: int = 1000,
     deltat: float = 0.01,
 ) -> CubeTraces:
     traces = [
         Trace(
             "DC",
-            "STA",
+            station,
             "",
             channel,
             tmin=tmin,
@@ -100,3 +101,27 @@ async def test_concurrent_appends_keep_all_samples(tmp_path: Path) -> None:
     for file in files:
         traces = load(str(file))
         assert sum(tr.ydata.size for tr in traces) == 4 * 1000
+
+
+async def feed(cubes: list[CubeTraces], pulled: list[CubeTraces]):
+    for cube in cubes:
+        pulled.append(cube)
+        yield cube
+
+
+async def test_async_save_bounds_cubes_in_flight(
+    tmp_path: Path, concurrency: dict[str, int]
+) -> None:
+    t0 = timestamp(2026, 3, 10)
+    cubes = [make_cube(f"C{i:02d}", t0, station=f"S{i}") for i in range(8)]
+    converter = Converter(output_path=tmp_path, write_threads=2)
+
+    pulled: list[CubeTraces] = []
+    task = asyncio.create_task(converter._async_save(feed(cubes, pulled)))
+    await asyncio.sleep(0.1)
+    # Two cubes are being written, a third waits for a free slot.
+    assert len(pulled) == 3
+
+    await task
+    assert len(pulled) == 8
+    assert concurrency["max"] == 2
