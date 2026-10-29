@@ -48,6 +48,13 @@ def template(tmp_path: Path) -> Path:
     return tmp_path / Converter().output_template
 
 
+def touch_outputs(traces: list[Trace], template: str, additional) -> None:
+    for tr in traces:
+        file = Path(tr.fill_template(template, **additional))
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.touch()
+
+
 @pytest.fixture
 def concurrency(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Replace the miniSEED writer with a slow stub tracking concurrent calls."""
@@ -59,10 +66,7 @@ def concurrency(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
             state["active"] += 1
             state["max"] = max(state["max"], state["active"])
         time.sleep(0.2)
-        for tr in traces:
-            file = Path(tr.fill_template(template, **additional))
-            file.parent.mkdir(parents=True, exist_ok=True)
-            file.touch()
+        touch_outputs(traces, template, additional)
         with lock:
             state["active"] -= 1
 
@@ -125,3 +129,26 @@ async def test_async_save_bounds_cubes_in_flight(
     await task
     assert len(pulled) == 8
     assert concurrency["max"] == 2
+
+
+async def test_async_save_raises_write_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing_save(traces: list[Trace], template: str, additional, **kwargs):
+        if traces[0].station == "S1":
+            raise OSError("disk full")
+        time.sleep(0.05)
+        touch_outputs(traces, template, additional)
+
+    monkeypatch.setattr(model, "save", failing_save)
+
+    t0 = timestamp(2026, 3, 10)
+    cubes = [make_cube(f"C{i:02d}", t0, station=f"S{i}") for i in range(20)]
+    converter = Converter(output_path=tmp_path, write_threads=2)
+
+    pulled: list[CubeTraces] = []
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await converter._async_save(feed(cubes, pulled))
+    assert exc_info.group_contains(OSError, match="disk full")
+    # No new cubes are started after the failure.
+    assert len(pulled) < len(cubes)

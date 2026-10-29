@@ -93,14 +93,29 @@ class Converter(BaseModel):
             finally:
                 slots.release()
 
-        tasks = []
+        tasks: set[asyncio.Task[None]] = set()
+        errors: list[BaseException] = []
+
+        def on_done(task: asyncio.Task[None]) -> None:
+            tasks.discard(task)
+            if not task.cancelled() and (exc := task.exception()):
+                logger.error("Failed to save data cube: %s", exc)
+                errors.append(exc)
+
         async for cube in datacube_traces:
             await slots.acquire()
+            if errors:
+                slots.release()
+                break
             task = asyncio.create_task(worker(cube))
-            tasks.append(task)
-            task.add_done_callback(lambda t: tasks.remove(t))
+            tasks.add(task)
+            task.add_done_callback(on_done)
 
-        await asyncio.gather(*tasks)
+        # Let started writes finish, so no cube is written without being
+        # recorded in the progress file.
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if errors:
+            raise ExceptionGroup("Failed to save data cubes", errors)
         logger.info("All done saving data cubes.")
 
     async def convert(self) -> None:
