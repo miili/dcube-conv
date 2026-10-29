@@ -3,12 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator, Iterator
 
 from pydantic import (
-    AwareDatetime,
     BaseModel,
     ByteSize,
     DirectoryPath,
@@ -28,11 +27,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 MB = 1_000_000
+MTIME_MARGIN_SECONDS = 60.0
 
 
 class LoadingStats(Stats):
     n_files: int = 0
     i_files: int = 0
+    n_files_failed: int = 0
     size_bytes_total: int = 0
     bytes_loaded: int = 0
     cube_ids: set[str] = Field(default_factory=set)
@@ -104,7 +105,8 @@ class LoadingStats(Stats):
             f" / {format_bytes(self.size_bytes_total)})",
         )
         table.add_row("Remaining time", format_timedelta(self.time_remaining))
-        table.add_row("Queue", f"{self.queue_size} / {self.queue_maxsize}")
+        table.add_row("Queue", f"{self.queue_size}/{self.queue_maxsize}")
+        table.add_row("Failed files", str(self.n_files_failed))
         table.add_row("Cube IDs", str(len(self.cube_ids)))
 
 
@@ -114,11 +116,10 @@ class DataCubeLoader(BaseModel):
     queue_size: PositiveInt = 16
     loading_threads: PositiveInt = 16
 
-    start_time: AwareDatetime | None = None
-    end_time: AwareDatetime | None = None
+    start_date: date | None = None
+    end_date: date | None = None
 
     cube_selection: set[CubeId] = set()
-    cube_ids: set[CubeId] = set()
 
     _stats: LoadingStats = PrivateAttr(default_factory=LoadingStats)
     _files: set[Path] = PrivateAttr(default_factory=set)
@@ -134,10 +135,20 @@ class DataCubeLoader(BaseModel):
 
     async def _scan_datacube_files(self) -> AsyncIterator[Path]:
         logger.info("Adding folders %s", ", ".join(str(d) for d in self.directories))
+        start_time = (
+            datetime.combine(self.start_date, datetime.min.time(), tzinfo=timezone.utc)
+            if self.start_date
+            else None
+        )
+        end_time = (
+            datetime.combine(self.end_date, datetime.max.time(), tzinfo=timezone.utc)
+            if self.end_date
+            else None
+        )
         for path in self.directories:
             logger.info("Scanning %s", path)
 
-            for file in path.rglob("*.*"):
+            for ifile, file in enumerate(path.rglob("*.*")):
                 if file.is_dir():
                     continue
                 if (
@@ -152,11 +163,12 @@ class DataCubeLoader(BaseModel):
                     continue
 
                 stat = file.stat()
+                st_mtime = stat.st_mtime - MTIME_MARGIN_SECONDS  # consider flush margin
                 if stat.st_size < self.min_file_size:
                     continue
-                if self.start_time and stat.st_mtime < self.start_time.timestamp():
+                if start_time and st_mtime < start_time.timestamp():
                     continue
-                if self.end_time and stat.st_mtime > self.end_time.timestamp():
+                if end_time and st_mtime > end_time.timestamp():
                     continue
                 with file.open("rb") as f:
                     if not datacube.detect(f.read(512)):
@@ -164,9 +176,12 @@ class DataCubeLoader(BaseModel):
 
                 self._filenames.add(file.name)
                 yield file
-                await asyncio.sleep(0)  # Yield to event loop
+                if ifile % 25 == 0:
+                    await asyncio.sleep(0)  # Yield to event loop
 
     async def prepare(self) -> None:
+        self._queue = asyncio.Queue(maxsize=self.queue_size)
+
         async for file in self._scan_datacube_files():
             cube_id = file.suffix.lstrip(".").upper()
             self._cube_ids.append(cube_id)
@@ -196,45 +211,49 @@ class DataCubeLoader(BaseModel):
         return iter(self._files)
 
     async def _fetch_datacubes(self) -> None:
-        queue = self._queue
-        iter_files = iter(self)
-        sem = asyncio.Semaphore(self.loading_threads)
-        done = asyncio.Event()
+        logger.debug("Fetching datacube files")
+        out_queue = self._queue
+        stats = self._stats
+        stats.set_queue(out_queue)
 
         loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=self.loading_threads)
 
-        self._stats.set_queue(queue)
-
-        logger.debug("Fetching datacube files")
+        files_queue = asyncio.Queue()
+        for file in self._files:
+            files_queue.put_nowait(file)
 
         async def load() -> None:
-            async with sem:
-                file = next(iter_files, None)
-                if file is None:
-                    done.set()
-                    return
-
+            while True:
+                file = await files_queue.get()
                 try:
                     cube = await loop.run_in_executor(
-                        executor, CubeTraces.from_file, file
+                        executor,
+                        CubeTraces.from_file,
+                        file,
                     )
-                except Warning as warn:
-                    logger.error("Failed to load %s: %s", file, exc_info=warn)
-                    return
+                    if cube is None:
+                        stats.n_files_failed += 1
+                    else:
+                        await out_queue.put(cube)
+                    stats.add_bytes(file.stat().st_size)
+                    stats.i_files += 1
+                finally:
+                    # Only after the cube is handed over, else join() returns
+                    # while workers still wait on out_queue and get cancelled.
+                    files_queue.task_done()
 
-                if cube is None:
-                    return
-                await queue.put(cube)
-                self._stats.add_bytes(file.stat().st_size)
-                self._stats.i_files += 1
-
-        async with asyncio.TaskGroup() as tg:
-            while not done.is_set():
-                await asyncio.sleep(0)
-                async with sem:
-                    tg.create_task(load())
-        await queue.put(None)
+        try:
+            async with asyncio.TaskGroup() as tg:
+                workers = [
+                    tg.create_task(load()) for _ in range(self.loading_threads * 2)
+                ]
+                await files_queue.join()
+                for worker in workers:
+                    worker.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            await out_queue.put(None)
 
     async def iter_datacubes(self) -> AsyncIterator[CubeTraces]:
         logger.info("Iterating datacube files")

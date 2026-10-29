@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING
 
 import fiona
 from pydantic import BaseModel, Field, FilePath, PositiveFloat, PrivateAttr
@@ -75,34 +75,24 @@ class Station(Location):
             raise RuntimeError(f"Station {self.name} has no parent.")
         return self._parent.has_orientation_overwrite(self.name)
 
-    @classmethod
-    def from_feature(cls, feature: dict[str, Any]) -> Self:
-        return cls(
-            lat=feature["geometry"]["coordinates"][1],
-            lon=feature["geometry"]["coordinates"][0],
-            elevation=feature["geometry"]["coordinates"][2],
-            depth=feature["properties"].get("depth", 0.0),
-            name=feature["properties"]["station_name"],
-            seismic_sensor=feature["properties"]["seismic_sensor"],
-            # location=feature["properties"].get("location", "") or "",
-        )
-
 
 class StationMapper(BaseModel):
     geopackage: FilePath = FilePath("stations.gpkg")
-    distance_threshold: PositiveFloat = 25.0
+    distance_threshold_meters: PositiveFloat = 25.0
+    sensor_field: str = "sensor"
+    station_field: str = "site_id"
     channel_map: dict[SensorID, ChannelMapping] = {
-        "4.5hz": {
+        "geophone": {
             "p0": "EPZ",
             "p1": "EPN",
             "p2": "EPE",
         },
-        "mark": {
+        "short-period": {
             "p0": "EHZ",
             "p1": "EHN",
             "p2": "EHE",
         },
-        "bb": {
+        "broadband": {
             "p0": "HHZ",
             "p1": "HHN",
             "p2": "HHE",
@@ -145,54 +135,77 @@ class StationMapper(BaseModel):
         except KeyError as exc:
             raise ValueError(f"Unknown channel dip: {channel}") from exc
 
-    def prepare(self):
-        check_geopackage(self.geopackage)
+    def prepare(self) -> None:
+        self.check_geopackage(self.geopackage)
         self.load_geopackage(self.geopackage)
 
     def load_geopackage(self, file: Path) -> None:
-        logger.info("Loading geopackage %s", file)
+        logger.info("Loading GeoPackage %s", file)
         with fiona.open(file) as data:
+            logger.info("Loaded %d features", len(data))
             for feature in data:
-                station = Station.from_feature(feature)
-                station.set_parent(self)
+                station = self.new_station(feature)
                 self._features.append(station)
+
+    def new_station(self, feature) -> Station:
+        try:
+            elevation = feature["geometry"]["coordinates"][2]
+        except IndexError:
+            elevation = 0.0
+        if not (name := feature["properties"][self.station_field]):
+            raise ValueError(f"Station feature {feature['id']} has no name.")
+
+        station = Station(
+            lat=feature["geometry"]["coordinates"][1],
+            lon=feature["geometry"]["coordinates"][0],
+            depth=feature["properties"].get("depth", 0.0),
+            elevation=elevation,
+            name=name,
+            seismic_sensor=feature["properties"][self.sensor_field],
+            # location=feature["properties"].get("location", "") or "",
+        )
+        station.set_parent(self)
+        return station
 
     def get_station(self, site: CubeSite) -> Station | None:
         distances = [feature.surface_distance_to(site) for feature in self._features]
         min_distance = min(distances)
-        if min_distance > self.distance_threshold:
+        if min_distance > self.distance_threshold_meters:
             return None
 
         station = self._features[distances.index(min_distance)]
         station.set_parent(self)
         return station
 
+    def check_geopackage(self, file: Path) -> None:
+        result = True
+        with fiona.open(file) as data:
+            for feature in data:
+                properties = feature["properties"]
 
-def check_geopackage(file: Path) -> bool:
-    result = True
-    with fiona.open(file) as data:
-        for feature in data:
-            properties = feature["properties"]
-            id = feature["id"]
-            if properties.get("status") == "planned":
-                continue
-            if not properties.get("station_name"):
-                logger.error("Feature %s has no station_name", id)
-                result = False
-            if not properties.get("seismic_sensor"):
-                logger.error("Feature %s has no seismic_sensor", id)
-                result = False
-            if not (geometry := feature.get("geometry")):
-                logger.error("Feature %s has no geometry", id)
-                result = False
-            if (
-                math.isnan(geometry["coordinates"][0])
-                or math.isnan(geometry["coordinates"][1])
-                or math.isnan(geometry["coordinates"][2])
-            ):
-                logger.error("Feature %s has nan geometry", id)
-                result = False
-            if geometry["coordinates"][2] == 0.0:
-                logger.error("Feature %s has no elevation", id)
-                result = False
-    return result
+                id = feature["id"]
+                if properties.get("status") == "not_installed":
+                    continue
+                if not properties.get(self.station_field):
+                    logger.error("Feature %s has no station_name", id)
+                    result = False
+                if not properties.get(self.sensor_field):
+                    logger.error("Feature %s has no seismic_sensor", id)
+                    result = False
+                if not (geometry := feature.get("geometry")):
+                    logger.error("Feature %s has no geometry", id)
+                    result = False
+                if (
+                    math.isnan(geometry["coordinates"][0])
+                    or geometry["coordinates"][0] == 0.0
+                    or math.isnan(geometry["coordinates"][1])
+                    or geometry["coordinates"][1] == 0.0
+                ):
+                    logger.error("Feature %s has bad geometry", id)
+                    result = False
+                # if geometry["coordinates"][2] == 0.0:
+                #     logger.error("Feature %s has no elevation", id)
+                #     result = False
+
+        if not result:
+            raise RuntimeError(f"GeoPackage {file} failed validation.")

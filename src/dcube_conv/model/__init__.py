@@ -3,28 +3,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import warnings
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Self
 
 import pyrocko.orthodrome as od
 from pydantic import BaseModel
-from pyrocko.io import datacube, save
+from pyrocko.io import save
 from pyrocko.trace import Trace
+
+from dcube_conv.utils import load_datacube
 
 logger = logging.getLogger(__name__)
 
 SteimCompression = Literal[1, 2]
 RecordLength = Literal[512, 1024, 2048, 4096, 8192]
 CubeId = str
-
-
-# warnings.filterwarnings("error", message="Extrapolating GPS time information")
-warnings.filterwarnings("error", message="No usable GPS timestamps found.")
-# warnings.filterwarnings("error", message="Small number of GPS tags found.")
 
 
 WRITE_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -60,12 +58,14 @@ class CubeTraces:
     def from_file(cls, file: Path) -> Self | None:
         logger.debug("Loading %s", file)
         try:
-            data = list(datacube.iload(str(file), yield_gps_tags=True))
+            traces, gps_tags = load_datacube(file)
         except (Warning, Exception) as warn:
             logger.warning("Failed to load %s: %s", file, warn)
             return None
-        gps_tags = data[0][1]
-        return cls(path=file, traces=[tr for (tr, _) in data], gps_tags=gps_tags)
+        if not traces:
+            logger.warning("No traces in %s", file)
+            return None
+        return cls(path=file, traces=traces, gps_tags=gps_tags)
 
     def set_nsl(self, network: str, station: str, location: str) -> None:
         for trace in self.traces:
@@ -80,24 +80,32 @@ class CubeTraces:
         output_path: Path,
         record_length: RecordLength = 4096,
         steim: SteimCompression = 2,
+        executor: ThreadPoolExecutor | None = None,
     ) -> int:
         tr_tmin = datetime.fromtimestamp(
             min(tr.tmin for tr in self.traces),
             tz=timezone.utc,
         )
-        # Some traces have a tmin that is just before midnight
-        tr_julianday = (tr_tmin + timedelta(seconds=10.0)).timetuple().tm_yday
+        tr_max = datetime.fromtimestamp(
+            max(tr.tmax for tr in self.traces),
+            tz=timezone.utc,
+        )
+        tr_tmid = tr_tmin + (tr_max - tr_tmin) / 2
+        loop = asyncio.get_running_loop()
+
+        func_call = partial(
+            save,
+            self.traces,
+            str(output_path),
+            additional={"julian_day": f"{tr_tmid.timetuple().tm_yday:03d}"},
+            record_length=record_length,
+            steim=steim,
+            append=True,
+        )
 
         async with get_lock(self.cube_id):
-            files = await asyncio.to_thread(
-                save,
-                self.traces,
-                str(output_path),
-                additional={"julianday": tr_julianday},
-                record_length=record_length,
-                steim=steim,
-                append=True,
-            )
+            files = await loop.run_in_executor(executor, func_call)
+
         return sum(Path(f).stat().st_size for f in files)
 
 

@@ -89,13 +89,7 @@ def main():
 
     args = parser.parse_args()
 
-    logging.root.setLevel(
-        level=logging.DEBUG
-        if args.v >= 2
-        else logging.INFO
-        if args.v >= 1
-        else logging.WARNING
-    )
+    logging.root.setLevel(max(logging.INFO - args.v * 10, logging.DEBUG))
 
     loop_debug = bool(args.v)
 

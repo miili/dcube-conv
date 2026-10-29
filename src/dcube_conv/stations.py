@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -49,7 +50,12 @@ class CubeSite(Location):
 
     @property
     def station_name(self) -> str:
-        return self.station.name if self.station else ""
+        name = self.station.name if self.station else ""
+        return re.sub(r"[^a-zA-Z0-9]", "", name)
+
+    @property
+    def wkt_geom(self) -> str:
+        return f"POINT Z({self.lon} {self.lat} {self.elevation})"
 
     def set_station(self, station: Station) -> None:
         self.station = station
@@ -93,8 +99,8 @@ class CubeSite(Location):
         return not (self.elevation == -999999.0 or self.elevation == 0.0)
 
     async def query_elevation(self, model: ElevationModel = "aster30m") -> None:
-        logger.debug("Querying elevation for %s", self)
         self.elevation = await get_elevation(self.lat, self.lon, model)
+        logger.info("New elevation for cube %s is %.1f m", self.cube_id, self.elevation)
 
 
 class CubeSites(BaseModel):
@@ -105,7 +111,7 @@ class CubeSites(BaseModel):
     post_processors: dict[SensorID, list[ProcessorType]] = {}
     station_blacklist: set[str] = Field(default_factory=set)
 
-    mapper: StationMapper | None = Field(default_factory=StationMapper)
+    mapper: StationMapper = Field(default_factory=StationMapper)
     no_site_info: set[CubeId] = Field(default_factory=set)
 
     _dump_path: Path | None = PrivateAttr(None)
@@ -113,8 +119,7 @@ class CubeSites(BaseModel):
 
     async def prepare(self) -> None:
         logger.info("Preparing CubeSites")
-        if self.mapper:
-            self.mapper.prepare()
+        self.mapper.prepare()
 
     @property
     def n_sites(self) -> int:
@@ -126,6 +131,7 @@ class CubeSites(BaseModel):
 
     def add_site(self, site: CubeSite) -> None:
         existing_sites = self.sites.get(site.cube_id, [])
+        self.write_site_csv(site, self._dump_path.with_suffix(".sites.csv"))
 
         for existing_site in existing_sites:
             if existing_site.is_close(site):
@@ -140,12 +146,13 @@ class CubeSites(BaseModel):
                 self.save()
                 return
 
-        if self.mapper:
-            if station := self.mapper.get_station(site):
-                site.set_station(station)
-                self._stats.n_stations += 1
-            else:
-                logger.error("No station found for site %s", site)
+        station = self.mapper.get_station(site)
+        if not station:
+            self.write_site_csv(site, self._dump_path.with_suffix(".bad_sites.csv"))
+            raise EnvironmentError("No station found for CubeSite %s" % site)
+
+        site.set_station(station)
+        self._stats.n_stations += 1
 
         self.sites[site.cube_id].append(site)
         self._stats.n_sites += 1
@@ -234,19 +241,34 @@ class CubeSites(BaseModel):
             async for cube in cubes:
                 new_site = await CubeSite.from_datacube_trace(cube)
                 if new_site:
-                    self.add_site(new_site)
+                    try:
+                        self.add_site(new_site)
+                    except EnvironmentError as e:
+                        logger.error("Failed to add site: %s from %s", e, cube.path)
+                        continue
                 site = self.get_site(cube)
-                if site:
-                    cube.set_nsl(self.network, site.station_name, site.location)
-                    if site.station:
-                        if site.station_name in self.station_blacklist:
-                            logger.info(
-                                "Skipping blacklisted station %s", site.station_name
-                            )
-                            continue
-                        for old, new in site.station.get_channel_map().items():
-                            cube.rename_channels(old, new)
-                        await self.post_process_datacube(cube, site)
+                if not site:
+                    logger.debug(
+                        "No site found for cube %s from %s",
+                        cube.cube_id,
+                        cube.path,
+                    )
+                    continue
+                if not site.station:
+                    logger.debug(
+                        "No station name for cube %s from %s",
+                        cube.cube_id,
+                        cube.path,
+                    )
+                    continue
+
+                cube.set_nsl(self.network, site.station_name, site.location)
+                if site.station_name in self.station_blacklist:
+                    logger.info("Skipping blacklisted station %s", site.station_name)
+                    continue
+                for old, new in site.station.get_channel_map().items():
+                    cube.rename_channels(old, new)
+                await self.post_process_datacube(cube, site)
 
                 yield cube
 
@@ -258,14 +280,26 @@ class CubeSites(BaseModel):
         logger.debug("Dumping CSV stations to %s", file)
         with file.open("w") as f:
             f.write(
-                "cube_id,location,lat,lon,elevation,depth,start_time,station_name\n"
+                "cube_id,location,lat,lon,elevation,depth,start_time,station_name,WKT_geom\n"
             )
             for site in self.iter_sites():
                 f.write(
                     f"{site.cube_id},{site.location},{site.lat},{site.lon},"
                     f"{site.elevation},{site.depth},{site.start_time},"
-                    f"{site.station_name}\n"
+                    f"{site.station_name},{site.wkt_geom}\n"
                 )
+
+    def write_site_csv(self, site: CubeSite, file: Path) -> None:
+        if not file.exists():
+            file.write_text(
+                "cube_id,location,lat,lon,elevation,depth,start_time,station_name,WKT_geom\n"
+            )
+        with file.open("a") as f:
+            f.write(
+                f"{site.cube_id},{site.location},{site.lat},{site.lon},"
+                f"{site.elevation},{site.depth},{site.start_time},"
+                f"{site.station_name},{site.wkt_geom}\n"
+            )
 
     def dump_pyrocko_yaml(self, file: Path) -> None:
         logger.debug("Dumping Pyrocko stations to %s", file)
@@ -284,7 +318,12 @@ class CubeSites(BaseModel):
 
     async def fill_elevations(self) -> None:
         """Fill missing elevations by querying them from online service."""
-        logger.info("Filling missing elevations")
+        n_missing = len([s for s in self.iter_sites() if not s.has_valid_elevation()])
+        logger.info(
+            "Filling missing elevations for %d sites from %s",
+            n_missing,
+            self.elevation_model,
+        )
         for site in self.iter_sites():
             if not site.has_valid_elevation():
                 await site.query_elevation(self.elevation_model)

@@ -106,14 +106,16 @@ def get_response(
 
 
 class StationXML(BaseModel):
-    source: str = "GFZ Potsdam"
+    source: str = "GFZ Helmholtz-Centre for Geosciences"
+    agency: str = "GFZ Helmholtz-Centre for Geosciences"
+
     country: str = "DE"
-    region: str = "Eifel"
+    region: str = "Western Bohemia"
     end_time: datetime = datetime(2023, 9, 1, tzinfo=timezone.utc)
-    description: str = "Eifel Large-N Seismic Network."
+    description: str = "ELISE - Eger Large-N Seismic Network"
 
     station_responses: dict[SensorID, StationResponse] = {
-        "4.5hz": StationResponse(
+        "geophone": StationResponse(
             sensor_name="4.5hz",
             sensor=(
                 "SensorNederland",
@@ -130,7 +132,7 @@ class StationXML(BaseModel):
                 "Sercel/Mark Products",
                 "L-4C",
                 "5500 Ohms",
-                "None",
+                "8905 Ohms",
             ),
             datalogger=("DiGOS/Omnirecs", "DATACUBE", "8"),
             sensor_description="Mark L-4C short-period geophone",
@@ -150,34 +152,36 @@ class StationXML(BaseModel):
 
     def get_inventory(self, sites: CubeSites) -> Inventory:
         sites.fill_endtimes(self.end_time)
-        start_date = datetime.max.replace(tzinfo=timezone.utc)
+        network_start_date = datetime.max.replace(tzinfo=timezone.utc)
 
         network = Network(
             code=sites.network,
             description=self.description,
-            start_date=UTCDateTime(start_date),
+            start_date=UTCDateTime(network_start_date),
             end_date=UTCDateTime(self.end_time),
             operators=[
                 Operator(
-                    agency="GFZ Potsdam",
+                    agency=self.agency,
                     contacts=[
                         Person(
                             names=["Marius Paul Isken"],
-                            agencies=["GFZ Potsdam"],
-                            emails=["mi@gfz-potsdam.de"],
+                            agencies=[self.agency],
+                            emails=["marius.isken@gfz.de"],
                         ),
                         Person(
                             names=["Torsten Dahm"],
-                            agencies=["GFZ Potsdam"],
-                            emails=["dahm@gfz-potsdam.de"],
+                            agencies=[self.agency],
+                            emails=["dahm@gfz.de"],
                         ),
                         Person(
-                            names=["Christoph Sens-Schönfelder"],
-                            agencies=["GFZ Potsdam"],
-                            emails=["sens-schoenfelder@gfz-potsdam.de"],
+                            names=["Jana Doubravová"],
+                            agencies=[
+                                "Institute of Geophysics, Czech Academy of Sciences"
+                            ],
+                            emails=["doubravka@ig.cas.cz"],
                         ),
                     ],
-                    website="https://gfz-potsdam.de",
+                    website="https://gfz.de",
                 )
             ],
         )
@@ -192,7 +196,7 @@ class StationXML(BaseModel):
                 )
                 continue
 
-            start_date = min(start_date, site.start_time)
+            network_start_date = min(network_start_date, site.start_time)
             equipment = self.station_responses[site.station.seismic_sensor]
             datalogger = equipment.get_datalogger_equipment(site.cube_id)
             sensor = equipment.get_sensor_equipment()
@@ -242,11 +246,11 @@ class StationXML(BaseModel):
 
             network.stations.append(station)
 
-        network.start_date = UTCDateTime(start_date)
+        network.start_date = UTCDateTime(network_start_date)
 
         inventory = Inventory(
-            source="GFZ Potsdam",
-            module="Pyrocko DataCube Raid",
+            source=self.source,
+            module="DataCube Raid",
             module_uri="https://pyrocko.org",
         )
         inventory.networks.append(network)
@@ -264,12 +268,12 @@ class StationXML(BaseModel):
         logger.info("Dumping missing stations to %s", file)
         with file.open("w") as f:
             f.write(
-                "cube_id,location,lat,lon,elevation,depth,start_time,station_name\n"
+                "cube_id,location,lat,lon,elevation,depth,start_time,station_name,WKT_geom\n"
             )
-            for site in sites.iter_sites():
-                if site.station is None:
+            for s in sites.iter_sites():
+                if s.station is None:
                     f.write(
-                        f"{site.cube_id},{site.location},{site.lat},{site.lon},"
-                        f"{site.elevation},{site.depth},{site.start_time},"
-                        f"{site.station_name}\n"
+                        f"{s.cube_id},{s.location},{s.lat},{s.lon},"
+                        f"{s.elevation},{s.depth},{s.start_time},"
+                        f"{s.station_name},{s.wkt_geom}\n"
                     )
