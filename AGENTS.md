@@ -80,9 +80,10 @@ DataCubeLoader.iter_datacubes()  ->  CubeSites.process_datacubes()  ->  Converte
   - `CubeTraces`, a dataclass with the path, Pyrocko traces and GPS tags.
     `from_file()` returns `None` on any exception or warning.
   - `CubeTraces.save()` appends to miniSEED through `pyrocko.io.save`. The
-    `julian_day` template key comes from the trace mid-time. Writes are
-    serialized per cube ID through `WRITE_LOCKS`, because appends to the same
-    SDS file must not race.
+    `year` and `julian_day` template keys both come from the cube mid-time.
+    Writes take a lock per output file (`get_lock`), acquired in sorted
+    order, because appends to the same SDS file must not race. It returns
+    the number of bytes written.
   - `Location` (lat/lon/elevation/depth) with distance helpers.
 - **`stations.py`**: `CubeSites` maps each cube ID to a list of `CubeSite`
   entries, one per deployment period and position. For each cube, it derives

@@ -163,3 +163,19 @@ async def test_save_returns_bytes_written(tmp_path: Path) -> None:
     assert first > 0
     assert second > 0
     assert first + second == total
+
+
+async def test_cube_spanning_new_year_uses_consistent_year(tmp_path: Path) -> None:
+    # Dec 31 20:00 to Jan 1 04:00, the mid-time is Jan 1 00:00.
+    t0 = timestamp(2025, 12, 31, 20)
+    cube = make_cube("ABC", t0, nsamples=2881, deltat=10.0)
+
+    await cube.save(template(tmp_path))
+
+    names = sorted(file.name for file in tmp_path.rglob("*.D.*"))
+    assert names == [
+        "DC.STA..EPE.D.2026.001",
+        "DC.STA..EPN.D.2026.001",
+        "DC.STA..EPZ.D.2026.001",
+    ]
+    assert all(path.parts[-5] == "2026" for path in tmp_path.rglob("*.D.*"))

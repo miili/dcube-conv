@@ -15,6 +15,7 @@ from pydantic import (
     PositiveInt,
     PrivateAttr,
     computed_field,
+    field_validator,
 )
 from rich.table import Table
 
@@ -63,9 +64,9 @@ class Converter(BaseModel):
 
     output_path: DirectoryPath = DirectoryPath("./sds")
     output_template: str = (
-        "%(tmin_year)s/%(network)s/%(station)s/%(channel)s.D"
+        "%(year)s/%(network)s/%(station)s/%(channel)s.D"
         "/%(network)s.%(station)s.%(location)s.%(channel)s.D"
-        ".%(tmin_year)s.%(julian_day)s"
+        ".%(year)s.%(julian_day)s"
     )
 
     record_length: RecordLength = 4096
@@ -74,6 +75,17 @@ class Converter(BaseModel):
     write_threads: PositiveInt = 16
 
     _stats: ConverterStats = PrivateAttr(default_factory=ConverterStats)
+
+    @field_validator("output_template")
+    @classmethod
+    def _check_template_dates(cls, template: str) -> str:
+        if "%(tmin_year)s" in template and "%(julian_day)s" in template:
+            logger.warning(
+                "output_template mixes %(tmin_year)s (trace start) with"
+                " %(julian_day)s (cube mid-time), cubes spanning New Year get"
+                " the wrong year. Use %(year)s instead."
+            )
+        return template
 
     async def _async_save(self, datacube_traces: AsyncIterator[CubeTraces]) -> None:
         executor = ThreadPoolExecutor(max_workers=self.write_threads)

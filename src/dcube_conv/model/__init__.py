@@ -101,7 +101,12 @@ class CubeTraces:
         tr_tmid = tr_tmin + (tr_max - tr_tmin) / 2
         loop = asyncio.get_running_loop()
 
-        additional = {"julian_day": f"{tr_tmid.timetuple().tm_yday:03d}"}
+        # Year and day of year of the same instant, so a cube spanning New
+        # Year ends up in a consistent day file.
+        additional = {
+            "year": f"{tr_tmid.year}",
+            "julian_day": f"{tr_tmid.timetuple().tm_yday:03d}",
+        }
         files = sorted(
             {tr.fill_template(str(output_path), **additional) for tr in self.traces}
         )
