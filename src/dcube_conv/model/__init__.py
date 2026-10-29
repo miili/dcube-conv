@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Self
 from weakref import WeakValueDictionary
@@ -35,6 +34,10 @@ def get_lock(file: str) -> asyncio.Lock:
     if lock is None:
         lock = WRITE_LOCKS[file] = asyncio.Lock()
     return lock
+
+
+def files_size(files: list[str]) -> int:
+    return sum(Path(f).stat().st_size for f in files if Path(f).exists())
 
 
 @dataclass
@@ -103,24 +106,24 @@ class CubeTraces:
             {tr.fill_template(str(output_path), **additional) for tr in self.traces}
         )
 
-        func_call = partial(
-            save,
-            self.traces,
-            str(output_path),
-            additional=additional,
-            record_length=record_length,
-            steim=steim,
-            append=True,
-        )
+        def write() -> int:
+            size_before = files_size(files)
+            save(
+                self.traces,
+                str(output_path),
+                additional=additional,
+                record_length=record_length,
+                steim=steim,
+                append=True,
+            )
+            return files_size(files) - size_before
 
         async with AsyncExitStack() as stack:
             # Appends to the same file must not interleave. Locking in sorted
             # order keeps cubes sharing several files from deadlocking.
             for file in files:
                 await stack.enter_async_context(get_lock(file))
-            await loop.run_in_executor(executor, func_call)
-
-        return sum(Path(f).stat().st_size for f in files)
+            return await loop.run_in_executor(executor, write)
 
 
 class Location(BaseModel):

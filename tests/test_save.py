@@ -152,3 +152,14 @@ async def test_async_save_raises_write_errors(
     assert exc_info.group_contains(OSError, match="disk full")
     # No new cubes are started after the failure.
     assert len(pulled) < len(cubes)
+
+
+async def test_save_returns_bytes_written(tmp_path: Path) -> None:
+    t0 = timestamp(2026, 3, 10)
+    first = await make_cube("ABC", t0).save(template(tmp_path))
+    second = await make_cube("ABC", t0 + 10.0).save(template(tmp_path))
+
+    total = sum(file.stat().st_size for file in tmp_path.rglob("*.D.*"))
+    assert first > 0
+    assert second > 0
+    assert first + second == total
