@@ -58,7 +58,7 @@ class ConverterStats(Stats):
 
 
 class Converter(BaseModel):
-    loader: DataCubeLoader = Field(default_factor=DataCubeLoader)
+    loader: DataCubeLoader = Field(default_factory=DataCubeLoader)
     stations: CubeSites = Field(default_factory=CubeSites)
 
     output_path: DirectoryPath = DirectoryPath("./sds")
