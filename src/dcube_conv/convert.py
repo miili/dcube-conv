@@ -20,8 +20,8 @@ from pydantic import (
 from rich.table import Table
 
 from dcube_conv.loader import DataCubeLoader
-from dcube_conv.model import CubeTraces, RecordLength, SteimCompression
-from dcube_conv.stations import CubeSites
+from dcube_conv.model import CubeFile, RecordLength, SteimCompression
+from dcube_conv.stations import CubeLocations
 from dcube_conv.stats import RuntimeStats, Stats
 from dcube_conv.utils import format_bytes
 
@@ -60,7 +60,7 @@ class ConverterStats(Stats):
 
 class Converter(BaseModel):
     loader: DataCubeLoader = Field(default_factory=DataCubeLoader)
-    stations: CubeSites = Field(default_factory=CubeSites)
+    stations: CubeLocations = Field(default_factory=CubeLocations)
 
     output_path: DirectoryPath = DirectoryPath("./sds")
     output_template: str = (
@@ -87,12 +87,12 @@ class Converter(BaseModel):
             )
         return template
 
-    async def _async_save(self, datacube_traces: AsyncIterator[CubeTraces]) -> None:
+    async def _async_save(self, datacube_traces: AsyncIterator[CubeFile]) -> None:
         executor = ThreadPoolExecutor(max_workers=self.write_threads)
         # Bounds the cubes held in memory, the loader queue then backs up.
         slots = asyncio.Semaphore(self.write_threads)
 
-        async def worker(cube: CubeTraces) -> None:
+        async def worker(cube: CubeFile) -> None:
             try:
                 nbytes = await cube.save(
                     self.output_path / self.output_template,
@@ -152,7 +152,7 @@ class Converter(BaseModel):
 
         station_file = file.with_name(f"{file.stem}.stations.json")
         if station_file.exists():
-            converter.stations = CubeSites.load(station_file)
+            converter.stations = CubeLocations.load(station_file)
         else:
             converter.stations._dump_path = station_file
 

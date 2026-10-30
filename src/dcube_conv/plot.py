@@ -9,14 +9,14 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-from dcube_conv.stations import CubeSite, CubeSites
+from dcube_conv.stations import CubeLocation, CubeLocations
 
 cycol = cycle(mcolors.TABLEAU_COLORS)
 OUT = Path("~/plot-out.csv").expanduser()
 OUT.write_text("cube_id,lat,lon\n")
 
 
-def site_coverage_rectangle(site: CubeSite, y_coord: float) -> None | Rectangle:
+def site_coverage_rectangle(site: CubeLocation, y_coord: float) -> None | Rectangle:
     if site.start_time == site.end_time:
         print("Zero length site", site)
     if site.station is None:
@@ -35,7 +35,7 @@ def site_coverage_rectangle(site: CubeSite, y_coord: float) -> None | Rectangle:
     )
 
 
-def plot_cube_coverage(cube_sites: CubeSites) -> None:
+def plot_cube_coverage(cube_sites: CubeLocations) -> None:
     cube_sites.fill_endtimes(datetime(2023, 9, 1, tzinfo=timezone.utc))
 
     _fig, ax = plt.subplots()

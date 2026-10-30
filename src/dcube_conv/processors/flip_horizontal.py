@@ -9,7 +9,7 @@ import numpy as np
 from dcube_conv.processors.base import Processor
 
 if TYPE_CHECKING:
-    from dcube_conv.model import CubeTraces
+    from dcube_conv.model import CubeFile
 
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class FlipHorizontals(Processor):
     name: str = "FlipHorizontals"
 
-    async def process(self, data: CubeTraces) -> CubeTraces:
+    async def process(self, data: CubeFile) -> None:
         for tr in data.traces:
             if tr.channel.endswith("Z"):
                 continue
@@ -30,4 +30,3 @@ class FlipHorizontals(Processor):
             )
             if tr.ydata is not None:
                 tr.ydata = await asyncio.to_thread(np.negative, tr.ydata)
-        return data

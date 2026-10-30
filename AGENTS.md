@@ -39,8 +39,10 @@ station names and channel codes.
 
 - `run.stations.json`: the serialized `CubeSites` state, which holds the
   discovered cube sites and their mapped stations. It is reloaded on the next
-  run when present. `CubeSites.save()` also writes `.csv` and `.yaml` (Pyrocko
-  stations) files, plus append-only `.sites.csv` and `.bad_sites.csv` files.
+  run when present. It is written atomically when a new location is added and
+  at most every 60 s otherwise. The derived `.csv` and `.yaml` (Pyrocko
+  stations) files are written only at the end of the run. Every datacube
+  file appends a row to `.sites.csv` or `.bad_sites.csv`.
 - `run.progress`: one converted file path per line. Files listed here are
   skipped on the next run, which makes conversion **resumable**. Delete it to
   re-convert.
@@ -52,7 +54,7 @@ The pipeline is fully `asyncio`. Blocking I/O runs in `ThreadPoolExecutor`s.
 
 ```
 DataCubeLoader.iter_datacubes()  ->  CubeSites.process_datacubes()  ->  Converter._async_save()
-   (loader.py)                         (stations.py)                      (convert.py -> CubeTraces.save)
+   (loader.py)                         (stations.py)                      (convert.py -> CubeFile.save)
 ```
 
 - **`convert.py`**: `Converter` is the root pydantic config: loader, stations,
@@ -77,22 +79,25 @@ DataCubeLoader.iter_datacubes()  ->  CubeSites.process_datacubes()  ->  Converte
   after the cube has been handed off. Keep that ordering, because
   `tests/test_loader.py` guards it.
 - **`model/__init__.py`**: holds the following:
-  - `CubeTraces`, a dataclass with the path, Pyrocko traces and GPS tags.
+  - `CubeFile`, a dataclass with the path, Pyrocko traces and GPS tags of
+    one datacube file.
     `from_file()` returns `None` on any exception or warning.
-  - `CubeTraces.save()` appends to miniSEED through `pyrocko.io.save`. The
+  - `CubeFile.save()` appends to miniSEED through `pyrocko.io.save`. The
     `year` and `julian_day` template keys both come from the cube mid-time.
     Writes take a lock per output file (`get_lock`), acquired in sorted
     order, because appends to the same SDS file must not race. It returns
     the number of bytes written.
   - `Location` (lat/lon/elevation/depth) with distance helpers.
-- **`stations.py`**: `CubeSites` maps each cube ID to a list of `CubeSite`
+- **`stations.py`**: `CubeSites` maps each cube ID to a list of `CubeLocation`
   entries, one per deployment period and position. For each cube, it derives
   a site from the GPS, merges it into an existing site within 25 m, or maps
   it to a `Station` through `StationMapper`. Next it finds the site that
   covers the cube start time and sets the NSL codes (`network`, the
   alphanumeric station name and the location). It then renames the channels
   and runs `post_processors`, which are keyed by **station name**.
-  `station_blacklist` stations are skipped.
+  `exclude_stations` are skipped. Processors modify the cube in place.
+  A location without a nearby station raises `StationNotFoundError`, and
+  its files are skipped.
 - **`station_mapper.py`**: `StationMapper` loads a GeoPackage through
   `fiona`. The `sensor_field`/`station_field` properties are configurable,
   and features with `status == "not_installed"` are ignored during
@@ -139,7 +144,7 @@ DataCubeLoader.iter_datacubes()  ->  CubeSites.process_datacubes()  ->  Converte
 
 - `tests/test_loader.py` uses `pytest-asyncio` (`asyncio_mode = "auto"`), so
   plain `async def test_*` functions work.
-- Unit tests monkeypatch `CubeTraces.from_file` and build loaders with
+- Unit tests monkeypatch `CubeFile.from_file` and build loaders with
   `make_loader()`.
 - `test_load_real_datacubes` reads real data from
   `/project/eifel-largen/data-elise/...`. It is skipped when that path is

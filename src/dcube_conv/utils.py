@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import warnings
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from functools import cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import aiohttp
 import numpy as np
@@ -222,3 +223,83 @@ def load_datacube(file: Path) -> tuple[list[Trace], Any]:
             traces.append(part)
 
     return traces, gps_tags
+
+
+DATACUBE_HEADER_SIZE = 512
+DATACUBE_BLOCK_MARKER = re.compile(rb"[\x80-\xef\xf1-\xff]")
+
+# GPS receivers with outdated firmware report dates from before the last GPS
+# week number rollover, 1024 weeks too early.
+GPS_LAST_WNRO = datetime(2019, 4, 7, tzinfo=timezone.utc)
+GPS_WNRO_PERIOD = timedelta(weeks=1024)
+
+
+class DataCubeHeader(NamedTuple):
+    """Minimal DATA-CUBE³ file header."""
+
+    device: str
+    n_channels: int
+    sampling_rate: int
+    gain: int
+    """Preamplifier gain (P_AMPL)."""
+    file_number: int
+    session_start: datetime
+    """Start of the recording session, UTC."""
+
+    @property
+    def recording_id(self) -> tuple[str, datetime, int]:
+        """Identifies the recorded file across copies. File names repeat yearly."""
+        return self.device, self.session_start, self.file_number
+
+    @property
+    def date(self) -> date:
+        """Day the file covers. Files after the first start at midnight."""
+        return self.session_start.date() + timedelta(days=self.file_number)
+
+    @property
+    def start_time(self) -> datetime:
+        """Start time of the file, UTC within a few seconds."""
+        if self.file_number == 0:
+            return self.session_start
+        return datetime.combine(self.date, time(), tzinfo=timezone.utc)
+
+
+def detect_datacube(data: bytes) -> DataCubeHeader:
+    """Parse the header of a DATA-CUBE³ file.
+
+    Args:
+        data (bytes): The first `DATACUBE_HEADER_SIZE` bytes of the file.
+
+    Returns:
+        DataCubeHeader: The parsed header.
+
+    Raises:
+        DataCubeError: If the data is not a DATA-CUBE³ header.
+    """
+    if len(data) < DATACUBE_HEADER_SIZE or data[0] >> 4 != 0xF:
+        raise DataCubeError("Not a DATA-CUBE³ file")
+
+    # The header ends with the first data (0x80) or GPS (0xa0) block marker.
+    end = DATACUBE_BLOCK_MARKER.search(data, 1)
+    if end is None:
+        raise DataCubeError("DATA-CUBE³ header is not terminated")
+
+    entries = data[1 : end.start()].replace(b"\xf0", b"").split(b";")
+    fields = dict(entry.split(b"=", 1) for entry in entries if b"=" in entry)
+    try:
+        session_start = datetime.strptime(
+            (fields[b"S_DATE"] + fields[b"S_TIME"]).decode(),
+            "%y/%m/%d%H:%M:%S",
+        ).replace(tzinfo=timezone.utc)
+        if session_start < GPS_LAST_WNRO:
+            session_start += GPS_WNRO_PERIOD
+        return DataCubeHeader(
+            device=fields[b"DEV_NO"].decode(),
+            n_channels=int(fields[b"CH_NUM"]),
+            sampling_rate=int(fields[b"S_RATE"]),
+            gain=int(fields[b"P_AMPL"]),
+            file_number=int(fields[b"DAT_NO"]),
+            session_start=session_start,
+        )
+    except (KeyError, ValueError, UnicodeDecodeError) as exc:
+        raise DataCubeError(f"Invalid DATA-CUBE³ header: {exc!r}") from exc

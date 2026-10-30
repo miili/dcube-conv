@@ -5,10 +5,11 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
-    from dcube_conv.model import CubeTraces
+    from dcube_conv.model import CubeFile
 
 
 class Processor(BaseModel):
     name: str = "Processor"
 
-    async def process(self, data: CubeTraces) -> CubeTraces: ...
+    async def process(self, data: CubeFile) -> None:
+        """Process the cube in place."""

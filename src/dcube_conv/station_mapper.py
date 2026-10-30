@@ -6,12 +6,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fiona
-from pydantic import BaseModel, Field, FilePath, PositiveFloat, PrivateAttr
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    FilePath,
+    PositiveFloat,
+    PrivateAttr,
+)
 
 from dcube_conv.model import Location
 
 if TYPE_CHECKING:
-    from dcube_conv.stations import CubeSite
+    from dcube_conv.stations import CubeLocation
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +53,13 @@ class StationOrientationOverwrite(BaseModel):
 
 
 class Station(Location):
-    name: str
+    # Old state files use `name`.
+    code: str = Field(validation_alias=AliasChoices("code", "name"))
     seismic_sensor: str
-    location: str = Field(default="", max_length=3)
+    # Old state files use `location`.
+    description: str = Field(
+        default="", validation_alias=AliasChoices("description", "location")
+    )
 
     _parent: StationMapper | None = PrivateAttr(None)
 
@@ -57,23 +68,23 @@ class Station(Location):
 
     def get_channel_map(self) -> ChannelMapping:
         if not self._parent:
-            raise RuntimeError(f"Station {self.name} has no parent.")
-        return self._parent.get_channel_map(self.seismic_sensor, self.name)
+            raise RuntimeError(f"Station {self.code} has no parent.")
+        return self._parent.get_channel_map(self.seismic_sensor, self.code)
 
     def get_channel_dip(self, channel: str) -> PositiveFloat:
         if not self._parent:
-            raise RuntimeError(f"Station {self.name} has no parent.")
-        return self._parent.get_channel_dip(self.seismic_sensor, self.name, channel)
+            raise RuntimeError(f"Station {self.code} has no parent.")
+        return self._parent.get_channel_dip(self.seismic_sensor, self.code, channel)
 
     def get_channel_azimuth(self, channel: str) -> PositiveFloat:
         if not self._parent:
-            raise RuntimeError(f"Station {self.name} has no parent.")
-        return self._parent.get_channel_azimuth(self.seismic_sensor, self.name, channel)
+            raise RuntimeError(f"Station {self.code} has no parent.")
+        return self._parent.get_channel_azimuth(self.seismic_sensor, self.code, channel)
 
     def has_orientation_overwrite(self) -> bool:
         if not self._parent:
-            raise RuntimeError(f"Station {self.name} has no parent.")
-        return self._parent.has_orientation_overwrite(self.name)
+            raise RuntimeError(f"Station {self.code} has no parent.")
+        return self._parent.has_orientation_overwrite(self.code)
 
 
 class StationMapper(BaseModel):
@@ -160,14 +171,14 @@ class StationMapper(BaseModel):
             lon=feature["geometry"]["coordinates"][0],
             depth=feature["properties"].get("depth", 0.0),
             elevation=elevation,
-            name=name,
+            code=name,
             seismic_sensor=feature["properties"][self.sensor_field],
             # location=feature["properties"].get("location", "") or "",
         )
         station.set_parent(self)
         return station
 
-    def get_station(self, site: CubeSite) -> Station | None:
+    def get_station(self, site: CubeLocation) -> Station | None:
         distances = [feature.surface_distance_to(site) for feature in self._features]
         min_distance = min(distances)
         if min_distance > self.distance_threshold_meters:

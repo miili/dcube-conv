@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from dcube_conv.station_mapper import SensorID
 
 if TYPE_CHECKING:
-    from dcube_conv.stations import CubeSites
+    from dcube_conv.stations import CubeLocations
 
 _NRL_INSTANCE = None
 NRLDatalogger = tuple[str, str, str]
@@ -150,7 +150,7 @@ class StationXML(BaseModel):
         ),
     }
 
-    def get_inventory(self, sites: CubeSites) -> Inventory:
+    def get_inventory(self, sites: CubeLocations) -> Inventory:
         sites.fill_endtimes(self.end_time)
         network_start_date = datetime.max.replace(tzinfo=timezone.utc)
 
@@ -217,7 +217,7 @@ class StationXML(BaseModel):
                 comments=[COMMENT_ORIENTATION] if is_misaligned else None,
                 site=Site(
                     name=site.station_name,
-                    description=site.station.location or "unknown",
+                    description=site.station.description or "unknown",
                     country=self.country,
                     region=self.region,
                 ),
@@ -230,7 +230,7 @@ class StationXML(BaseModel):
             for channel_name in site.station.get_channel_map().values():
                 channel = Channel(
                     code=channel_name,
-                    location_code=site.location,
+                    location_code=site.location_code,
                     latitude=Latitude(station.latitude, datum="EPSG:4326"),
                     longitude=Longitude(station.longitude, datum="EPSG:4326"),
                     elevation=round(site.elevation, 1),
@@ -256,7 +256,7 @@ class StationXML(BaseModel):
         inventory.networks.append(network)
         return inventory
 
-    def dump_stationxml(self, sites: CubeSites, file: Path):
+    def dump_stationxml(self, sites: CubeLocations, file: Path):
         logger.info("Dumping StationXML to %s", file)
         inv = self.get_inventory(sites)
         n_stations = sum(len(net.stations) for net in inv.networks)
@@ -264,7 +264,7 @@ class StationXML(BaseModel):
         inv.write(file, format="STATIONXML", validate=True)
         self.dump_missing_stations_csv(sites, file.with_suffix(".missing.csv"))
 
-    def dump_missing_stations_csv(self, sites: CubeSites, file: Path):
+    def dump_missing_stations_csv(self, sites: CubeLocations, file: Path):
         logger.info("Dumping missing stations to %s", file)
         with file.open("w") as f:
             f.write(
@@ -273,7 +273,7 @@ class StationXML(BaseModel):
             for s in sites.iter_sites():
                 if s.station is None:
                     f.write(
-                        f"{s.cube_id},{s.location},{s.lat},{s.lon},"
+                        f"{s.cube_id},{s.location_code},{s.lat},{s.lon},"
                         f"{s.elevation},{s.depth},{s.start_time},"
                         f"{s.station_name},{s.wkt_geom}\n"
                     )

@@ -113,10 +113,10 @@ def main():
 
             print_json(StationXML().model_dump_json(indent=2))
         elif args.xml_command == "create":
-            from dcube_conv.stations import CubeSites
+            from dcube_conv.stations import CubeLocations
             from dcube_conv.stationxml import StationXML
 
-            sites = CubeSites.load(args.input_stations)
+            sites = CubeLocations.load(args.input_stations)
             if args.fill_elevations:
                 asyncio.run(sites.fill_elevations())
             stationxml = StationXML.model_validate_json(args.input_config.read_bytes())
@@ -124,9 +124,9 @@ def main():
 
     elif args.command == "plot":
         from dcube_conv.plot import plot_cube_coverage
-        from dcube_conv.stations import CubeSites
+        from dcube_conv.stations import CubeLocations
 
-        sites = CubeSites.load(args.input_path)
+        sites = CubeLocations.load(args.input_path)
         plot_cube_coverage(sites)
 
     else:

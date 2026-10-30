@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator, Iterator
 
@@ -16,18 +17,22 @@ from pydantic import (
     PrivateAttr,
     computed_field,
 )
-from pyrocko.io import datacube
+from pyrocko.io.datacube import DataCubeError
 
-from dcube_conv.model import CubeId, CubeTraces
+from dcube_conv.model import CubeFile, CubeId
 from dcube_conv.stats import Stats
-from dcube_conv.utils import format_bytes
+from dcube_conv.utils import (
+    DATACUBE_HEADER_SIZE,
+    DataCubeHeader,
+    detect_datacube,
+    format_bytes,
+)
 
 if TYPE_CHECKING:
     from rich.table import Table
 
 logger = logging.getLogger(__name__)
 MB = 1_000_000
-MTIME_MARGIN_SECONDS = 60.0
 
 
 class LoadingStats(Stats):
@@ -123,28 +128,19 @@ class DataCubeLoader(BaseModel):
 
     _stats: LoadingStats = PrivateAttr(default_factory=LoadingStats)
     _files: set[Path] = PrivateAttr(default_factory=set)
-    _filenames: set[str] = PrivateAttr(default_factory=set)
     _cube_ids: list[CubeId] = PrivateAttr(default_factory=list)
 
     _progress_file: Path | None = PrivateAttr(default=None)
     _done_paths: set[Path] = PrivateAttr(default_factory=set)
 
-    _queue: asyncio.Queue[CubeTraces | None] = PrivateAttr(
+    _queue: asyncio.Queue[CubeFile | None] = PrivateAttr(
         default_factory=lambda: asyncio.Queue(maxsize=32)
     )
 
-    async def _scan_datacube_files(self) -> AsyncIterator[Path]:
+    async def _scan_datacube_files(
+        self,
+    ) -> AsyncIterator[tuple[Path, DataCubeHeader]]:
         logger.info("Adding folders %s", ", ".join(str(d) for d in self.directories))
-        start_time = (
-            datetime.combine(self.start_date, datetime.min.time(), tzinfo=timezone.utc)
-            if self.start_date
-            else None
-        )
-        end_time = (
-            datetime.combine(self.end_date, datetime.max.time(), tzinfo=timezone.utc)
-            if self.end_date
-            else None
-        )
         for path in self.directories:
             logger.info("Scanning %s", path)
 
@@ -156,33 +152,40 @@ class DataCubeLoader(BaseModel):
                     and file.suffix.lstrip(".").upper() not in self.cube_selection
                 ):
                     continue
-                if file in self._done_paths:
-                    continue
-                if file.name in self._filenames:
-                    logger.warning("Duplicate file %s", file)
-                    continue
-
-                stat = file.stat()
-                st_mtime = stat.st_mtime - MTIME_MARGIN_SECONDS  # consider flush margin
-                if stat.st_size < self.min_file_size:
-                    continue
-                if start_time and st_mtime < start_time.timestamp():
-                    continue
-                if end_time and st_mtime > end_time.timestamp():
+                if file.stat().st_size < self.min_file_size:
                     continue
                 with file.open("rb") as f:
-                    if not datacube.detect(f.read(512)):
+                    try:
+                        header = detect_datacube(f.read(DATACUBE_HEADER_SIZE))
+                    except DataCubeError:
                         continue
+                # File modification times are unreliable, they change on copy.
+                if self.start_date and header.date < self.start_date:
+                    continue
+                if self.end_date and header.date > self.end_date:
+                    continue
 
-                self._filenames.add(file.name)
-                yield file
+                yield file, header
                 if ifile % 25 == 0:
                     await asyncio.sleep(0)  # Yield to event loop
 
     async def prepare(self) -> None:
         self._queue = asyncio.Queue(maxsize=self.queue_size)
 
-        async for file in self._scan_datacube_files():
+        recordings: defaultdict[tuple, list[Path]] = defaultdict(list)
+        async for file, header in self._scan_datacube_files():
+            recordings[header.recording_id].append(file)
+
+        for copies in recordings.values():
+            if len(copies) > 1:
+                logger.warning(
+                    "Duplicate recording in %s", ", ".join(str(f) for f in copies)
+                )
+            # Also skips copies of converted files, they would be appended twice.
+            if self._done_paths.intersection(copies):
+                continue
+            file = max(copies, key=lambda f: f.stat().st_size)
+
             cube_id = file.suffix.lstrip(".").upper()
             self._cube_ids.append(cube_id)
             self._files.add(file)
@@ -229,7 +232,7 @@ class DataCubeLoader(BaseModel):
                 try:
                     cube = await loop.run_in_executor(
                         executor,
-                        CubeTraces.from_file,
+                        CubeFile.from_file,
                         file,
                     )
                     if cube is None:
@@ -255,7 +258,7 @@ class DataCubeLoader(BaseModel):
             executor.shutdown(wait=False, cancel_futures=True)
             await out_queue.put(None)
 
-    async def iter_datacubes(self) -> AsyncIterator[CubeTraces]:
+    async def iter_datacubes(self) -> AsyncIterator[CubeFile]:
         logger.info("Iterating datacube files")
         task = asyncio.create_task(self._fetch_datacubes())
 
@@ -268,7 +271,7 @@ class DataCubeLoader(BaseModel):
 
         await task
 
-    def add_done(self, cube: CubeTraces) -> None:
+    def add_done(self, cube: CubeFile) -> None:
         if not self._progress_file:
             return
         with self._progress_file.open("a") as f:

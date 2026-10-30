@@ -16,7 +16,12 @@ from pydantic import BaseModel
 from pyrocko.io import save
 from pyrocko.trace import Trace
 
-from dcube_conv.utils import load_datacube
+from dcube_conv.utils import (
+    DATACUBE_HEADER_SIZE,
+    DataCubeHeader,
+    detect_datacube,
+    load_datacube,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +46,9 @@ def files_size(files: list[str]) -> int:
 
 
 @dataclass
-class CubeTraces:
+class CubeFile:
     path: Path
+    header: DataCubeHeader
     traces: list[Trace]
     gps_tags: Any
 
@@ -66,6 +72,8 @@ class CubeTraces:
     def from_file(cls, file: Path) -> Self | None:
         logger.debug("Loading %s", file)
         try:
+            with file.open("rb") as f:
+                header = detect_datacube(f.read(DATACUBE_HEADER_SIZE))
             traces, gps_tags = load_datacube(file)
         except (Warning, Exception) as warn:
             logger.warning("Failed to load %s: %s", file, warn)
@@ -73,7 +81,7 @@ class CubeTraces:
         if not traces:
             logger.warning("No traces in %s", file)
             return None
-        return cls(path=file, traces=traces, gps_tags=gps_tags)
+        return cls(path=file, header=header, traces=traces, gps_tags=gps_tags)
 
     def set_nsl(self, network: str, station: str, location: str) -> None:
         for trace in self.traces:

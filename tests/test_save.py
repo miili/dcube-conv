@@ -13,9 +13,12 @@ from pyrocko.trace import Trace
 
 from dcube_conv import model
 from dcube_conv.convert import Converter
-from dcube_conv.model import CubeTraces
+from dcube_conv.model import CubeFile
+from dcube_conv.utils import detect_datacube
+from tests.test_utils import make_header
 
 DAY = 86400.0
+HEADER = detect_datacube(make_header())
 
 
 def make_cube(
@@ -24,7 +27,7 @@ def make_cube(
     station: str = "STA",
     nsamples: int = 1000,
     deltat: float = 0.01,
-) -> CubeTraces:
+) -> CubeFile:
     traces = [
         Trace(
             "DC",
@@ -37,7 +40,9 @@ def make_cube(
         )
         for channel in ("EPZ", "EPN", "EPE")
     ]
-    return CubeTraces(path=Path(f"00000000.{cube_id}"), traces=traces, gps_tags=None)
+    return CubeFile(
+        path=Path(f"00000000.{cube_id}"), header=HEADER, traces=traces, gps_tags=None
+    )
 
 
 def timestamp(*args: int) -> float:
@@ -107,7 +112,7 @@ async def test_concurrent_appends_keep_all_samples(tmp_path: Path) -> None:
         assert sum(tr.ydata.size for tr in traces) == 4 * 1000
 
 
-async def feed(cubes: list[CubeTraces], pulled: list[CubeTraces]):
+async def feed(cubes: list[CubeFile], pulled: list[CubeFile]):
     for cube in cubes:
         pulled.append(cube)
         yield cube
@@ -120,7 +125,7 @@ async def test_async_save_bounds_cubes_in_flight(
     cubes = [make_cube(f"C{i:02d}", t0, station=f"S{i}") for i in range(8)]
     converter = Converter(output_path=tmp_path, write_threads=2)
 
-    pulled: list[CubeTraces] = []
+    pulled: list[CubeFile] = []
     task = asyncio.create_task(converter._async_save(feed(cubes, pulled)))
     await asyncio.sleep(0.1)
     # Two cubes are being written, a third waits for a free slot.
@@ -146,7 +151,7 @@ async def test_async_save_raises_write_errors(
     cubes = [make_cube(f"C{i:02d}", t0, station=f"S{i}") for i in range(20)]
     converter = Converter(output_path=tmp_path, write_threads=2)
 
-    pulled: list[CubeTraces] = []
+    pulled: list[CubeFile] = []
     with pytest.raises(ExceptionGroup) as exc_info:
         await converter._async_save(feed(cubes, pulled))
     assert exc_info.group_contains(OSError, match="disk full")
