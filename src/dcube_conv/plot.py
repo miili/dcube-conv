@@ -1,54 +1,40 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from itertools import cycle
-from pathlib import Path
 
 import matplotlib.colors as mcolors
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-from dcube_conv.stations import CubeLocation, CubeLocations
-
-cycol = cycle(mcolors.TABLEAU_COLORS)
-OUT = Path("~/plot-out.csv").expanduser()
-OUT.write_text("cube_id,lat,lon\n")
+from dcube_conv.stations import Deployments
 
 
-def site_coverage_rectangle(site: CubeLocation, y_coord: float) -> None | Rectangle:
-    if site.start_time == site.end_time:
-        print("Zero length site", site)
-    if site.station is None:
-        print("Site without station", site)
-        with OUT.open("a") as f:
-            f.write(f"{site.cube_id},{site.lat},{site.lon}\n")
-    else:
-        return None
-    return Rectangle(
-        (site.start_time, y_coord),
-        site.end_time - site.start_time,
-        1,
-        ec="k",
-        lw=0.5,
-        fc=next(cycol),
-    )
-
-
-def plot_cube_coverage(cube_sites: CubeLocations) -> None:
-    cube_sites.fill_endtimes(datetime(2023, 9, 1, tzinfo=timezone.utc))
-
+def plot_cube_coverage(deployments: Deployments) -> None:
+    """Plot the deployments of each cube over time, colored by station."""
     _fig, ax = plt.subplots()
 
-    cubes = list(cube_sites.sites.keys())
+    cubes = sorted({d.cube_id for d in deployments.iter_deployments()})
+    colors = dict(
+        zip(
+            sorted({d.station_code for d in deployments.iter_deployments()}),
+            cycle(mcolors.TABLEAU_COLORS),
+            strict=False,
+        )
+    )
+    for deployment in deployments.iter_deployments():
+        ax.add_patch(
+            Rectangle(
+                (deployment.start_time, cubes.index(deployment.cube_id)),
+                deployment.end_time - deployment.start_time,
+                1,
+                ec="k",
+                lw=0.5,
+                fc=colors[deployment.station_code] if deployment.station else "w",
+            )
+        )
 
-    for site in cube_sites.iter_sites():
-        y_loc = cubes.index(site.cube_id)
-        rect = site_coverage_rectangle(site, y_loc)
-        if rect is not None:
-            ax.add_patch(rect)
-
-    ax.set_yticks(range(cube_sites.n_cubes))
+    ax.set_yticks(range(len(cubes)))
     ax.set_yticklabels(cubes)
 
     ax.autoscale_view()

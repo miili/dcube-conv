@@ -6,7 +6,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, ClassVar, Iterator
 
 from pydantic import (
     BaseModel,
@@ -18,33 +18,48 @@ from pydantic import (
     computed_field,
 )
 from pyrocko.io.datacube import DataCubeError
+from rich.console import RenderableType
+from rich.progress import Progress
 
 from dcube_conv.model import CubeFile, CubeId
-from dcube_conv.stats import Stats
+from dcube_conv.stats import Stats, StatsTable, make_progress, percent, problem
 from dcube_conv.utils import (
     DATACUBE_HEADER_SIZE,
     DataCubeHeader,
+    SessionId,
     detect_datacube,
     format_bytes,
 )
-
-if TYPE_CHECKING:
-    from rich.table import Table
 
 logger = logging.getLogger(__name__)
 MB = 1_000_000
 
 
 class LoadingStats(Stats):
+    title: ClassVar[str] = "Files"
+
+    scanning: bool = True
+    n_scanned: int = 0
+    bytes_scanned: int = 0
+    n_copies: int = 0
+    bytes_copies: int = 0
+    n_done: int = 0
+    bytes_done: int = 0
     n_files: int = 0
     i_files: int = 0
     n_files_failed: int = 0
+    bytes_failed: int = 0
     size_bytes_total: int = 0
     bytes_loaded: int = 0
-    cube_ids: set[str] = Field(default_factory=set)
     time_started: datetime = Field(default_factory=datetime.now)
 
     _queue: asyncio.Queue | None = PrivateAttr(default=None)
+    _bar: Progress = PrivateAttr(default_factory=make_progress)
+
+    def model_post_init(self, __context: Any) -> None:
+        super().model_post_init(__context)
+        self._position = 0
+        self._task = self._bar.add_task("Scanning", total=None, detail="")
 
     def set_queue(self, queue: asyncio.Queue) -> None:
         self._queue = queue
@@ -77,16 +92,9 @@ class LoadingStats(Stats):
 
     @computed_field
     @property
-    def time_remaining(self) -> timedelta:
-        if self.loading_rate == 0:
-            return timedelta(seconds=0)
-        return timedelta(
-            seconds=(self.size_bytes_total - self.bytes_loaded) / self.loading_rate
-        )
-
-    @computed_field
-    @property
     def processed_percent(self) -> float:
+        if not self.size_bytes_total:
+            return 0.0
         return self.bytes_loaded / self.size_bytes_total * 100
 
     def add_bytes(self, nbytes: int) -> None:
@@ -94,25 +102,45 @@ class LoadingStats(Stats):
             self.time_started = datetime.now()  # noqa DTZ005
         self.bytes_loaded += nbytes
 
-    def _populate_table(self, table: Table) -> None:
-        def format_timedelta(td: timedelta) -> str:
-            return str(td).split(".")[0]
+    def progress_bar(self) -> RenderableType:
+        if self.scanning:
+            self._bar.update(
+                self._task, detail=f"{self.n_scanned:,} datacube files found"
+            )
+        else:
+            self._bar.update(
+                self._task,
+                description="Converting",
+                total=self.size_bytes_total or 1,
+                completed=self.bytes_loaded,
+                detail=f"{self.i_files:,}/{self.n_files:,} files"
+                f" · {format_bytes(self.loading_rate)}/s",
+            )
+        return self._bar
 
-        table.add_row(
-            "Progress",
-            f"[bold]{self.processed_percent:.1f}%[/bold]",
-            f"({self.i_files} / {self.n_files})",
+    def _populate(self, table: StatsTable) -> None:
+        table.row(
+            "found",
+            self.n_scanned,
+            size=self.bytes_scanned,
+            detail=f"{self.n_copies:,} copies skipped"
+            f" · {format_bytes(self.bytes_copies)}",
         )
-        table.add_row(
-            "Processing rate",
-            f"{format_bytes(self.loading_rate)}/s",
-            f"({format_bytes(self.bytes_loaded)}"
-            f" / {format_bytes(self.size_bytes_total)})",
+        table.row(
+            "converted",
+            self.n_done,
+            size=self.bytes_done,
+            detail=f"{percent(self.bytes_done, self.bytes_scanned)} of found,"
+            " in earlier runs",
         )
-        table.add_row("Remaining time", format_timedelta(self.time_remaining))
-        table.add_row("Queue", f"{self.queue_size}/{self.queue_maxsize}")
-        table.add_row("Failed files", str(self.n_files_failed))
-        table.add_row("Cube IDs", str(len(self.cube_ids)))
+        table.row(
+            "to convert",
+            self.n_files,
+            size=self.size_bytes_total,
+            detail=f"{self.i_files - self.n_files_failed:,} loaded"
+            f" · {problem(self.n_files_failed, 'failed', 'red')}"
+            f" · queue {self.queue_size}/{self.queue_maxsize}",
+        )
 
 
 class DataCubeLoader(BaseModel):
@@ -128,7 +156,9 @@ class DataCubeLoader(BaseModel):
 
     _stats: LoadingStats = PrivateAttr(default_factory=LoadingStats)
     _files: set[Path] = PrivateAttr(default_factory=set)
-    _cube_ids: list[CubeId] = PrivateAttr(default_factory=list)
+    _sessions: defaultdict[SessionId, list[tuple[Path, DataCubeHeader]]] = PrivateAttr(
+        default_factory=lambda: defaultdict(list)
+    )
 
     _progress_file: Path | None = PrivateAttr(default=None)
     _done_paths: set[Path] = PrivateAttr(default_factory=set)
@@ -139,7 +169,7 @@ class DataCubeLoader(BaseModel):
 
     async def _scan_datacube_files(
         self,
-    ) -> AsyncIterator[tuple[Path, DataCubeHeader]]:
+    ) -> AsyncIterator[tuple[Path, DataCubeHeader, int]]:
         logger.info("Adding folders %s", ", ".join(str(d) for d in self.directories))
         for path in self.directories:
             logger.info("Scanning %s", path)
@@ -152,7 +182,8 @@ class DataCubeLoader(BaseModel):
                     and file.suffix.lstrip(".").upper() not in self.cube_selection
                 ):
                     continue
-                if file.stat().st_size < self.min_file_size:
+                size = file.stat().st_size
+                if size < self.min_file_size:
                     continue
                 with file.open("rb") as f:
                     try:
@@ -165,40 +196,56 @@ class DataCubeLoader(BaseModel):
                 if self.end_date and header.date > self.end_date:
                     continue
 
-                yield file, header
+                yield file, header, size
                 if ifile % 25 == 0:
                     await asyncio.sleep(0)  # Yield to event loop
 
     async def prepare(self) -> None:
         self._queue = asyncio.Queue(maxsize=self.queue_size)
+        stats = self._stats
 
-        recordings: defaultdict[tuple, list[Path]] = defaultdict(list)
-        async for file, header in self._scan_datacube_files():
-            recordings[header.recording_id].append(file)
+        recordings: defaultdict[tuple, list[tuple[Path, DataCubeHeader, int]]] = (
+            defaultdict(list)
+        )
+        async for file, header, size in self._scan_datacube_files():
+            recordings[header.recording_id].append((file, header, size))
+            stats.n_scanned += 1
+            stats.bytes_scanned += size
 
         for copies in recordings.values():
+            file, header, size = max(copies, key=lambda copy: copy[2])
             if len(copies) > 1:
-                logger.warning(
-                    "Duplicate recording in %s", ", ".join(str(f) for f in copies)
+                stats.n_copies += len(copies) - 1
+                stats.bytes_copies += sum(copy[2] for copy in copies) - size
+                logger.debug(
+                    "Duplicate recording in %s", ", ".join(str(c[0]) for c in copies)
                 )
+            self._sessions[header.session_id].append((file, header))
             # Also skips copies of converted files, they would be appended twice.
-            if self._done_paths.intersection(copies):
+            if self._done_paths.intersection(copy[0] for copy in copies):
+                stats.n_done += 1
+                stats.bytes_done += size
                 continue
-            file = max(copies, key=lambda f: f.stat().st_size)
 
-            cube_id = file.suffix.lstrip(".").upper()
-            self._cube_ids.append(cube_id)
             self._files.add(file)
+            stats.n_files += 1
+            stats.size_bytes_total += size
 
-            self._stats.cube_ids.add(cube_id)
-            self._stats.n_files += 1
-            self._stats.size_bytes_total += file.stat().st_size
-
+        for session in self._sessions.values():
+            session.sort(key=lambda recording: recording[1].file_number)
+        stats.scanning = False
         logger.info(
-            "Found %d datacube files, total %s",
-            self._stats.n_files,
-            ByteSize(self._stats.size_bytes_total).human_readable(decimal=True),
+            "Found %d datacube files in %d sessions, %d to convert (%s)",
+            len(recordings),
+            len(self._sessions),
+            stats.n_files,
+            ByteSize(stats.size_bytes_total).human_readable(decimal=True),
         )
+
+    @property
+    def sessions(self) -> dict[SessionId, list[tuple[Path, DataCubeHeader]]]:
+        """All recordings in range per session, including converted ones."""
+        return self._sessions
 
     def set_progress_file(self, file: Path) -> None:
         logger.debug("Setting progress file %s", file)
@@ -235,11 +282,13 @@ class DataCubeLoader(BaseModel):
                         CubeFile.from_file,
                         file,
                     )
+                    size = file.stat().st_size
                     if cube is None:
                         stats.n_files_failed += 1
+                        stats.bytes_failed += size
                     else:
                         await out_queue.put(cube)
-                    stats.add_bytes(file.stat().st_size)
+                    stats.add_bytes(size)
                     stats.i_files += 1
                 finally:
                     # Only after the cube is handed over, else join() returns

@@ -44,8 +44,6 @@ ElevationModel = Literal[
 
 LAST_REQUEST = datetime_now()
 
-DATETIME_MAX = datetime.max.replace(tzinfo=timezone.utc)
-
 
 async def get_elevation(
     lat: float,
@@ -86,7 +84,8 @@ async def get_elevation(
 
 
 def format_bytes(b: int | float) -> str:
-    return ByteSize(b).human_readable(decimal=True)
+    """Decimal data size with a space before the unit, e.g. 23.9 TB."""
+    return re.sub(r"(?<=\d)(?=[A-Za-z])", " ", ByteSize(b).human_readable(decimal=True))
 
 
 @cache
@@ -216,7 +215,13 @@ def load_datacube(file: Path) -> tuple[list[Trace], Any]:
         for part in parts:
             t_ref = 0.5 * (part.tmin + part.tmax)
             leap_second = util.utc_gps_offset(t_ref)
-            if check_WNRO(utc_gps_offsets, leap_second):
+            # A single bogus UTC offset in the GPS tags fails the rollover
+            # check. A rolled over receiver reports times before the last
+            # rollover, never recent ones.
+            if (
+                check_WNRO(utc_gps_offsets, leap_second)
+                and t_ref < GPS_LAST_WNRO.timestamp()
+            ):
                 part.shift(WNRO)
                 leap_second = util.utc_gps_offset(t_ref + WNRO)
             part.shift(leap_second)
@@ -233,6 +238,41 @@ DATACUBE_BLOCK_MARKER = re.compile(rb"[\x80-\xef\xf1-\xff]")
 GPS_LAST_WNRO = datetime(2019, 4, 7, tzinfo=timezone.utc)
 GPS_WNRO_PERIOD = timedelta(weeks=1024)
 
+# GPS tags at the end of a file used to time its last sample.
+N_END_TAGS = 64
+
+
+def gps_end_time(tags: GPSTags, nsamples: int, sampling_rate: float) -> datetime | None:
+    """Time of the last sample of a file from its last GPS tags, UTC.
+
+    The cube clock drifts by up to about 30 s per day. After a few months, the
+    nominal end, from the file start and the sample count, is up to an hour
+    late. The GPS tags give the true time of the samples they tag.
+
+    Args:
+        tags (GPSTags): The GPS tags of the file.
+        nsamples (int): Number of samples in the file.
+        sampling_rate (float): Nominal sampling rate in [Hz].
+
+    Returns:
+        datetime | None: The end time, None without a GPS fix.
+    """
+    fix = tags.fix > 0
+    if not fix.any():
+        return None
+    deltat = 1.0 / sampling_rate
+    positions = tags.position[fix][-N_END_TAGS:]
+    times = tags.gps_time[fix][-N_END_TAGS:]
+    gps_end = float(np.median(times - positions * deltat)) + (nsamples - 1) * deltat
+    if gps_end < GPS_LAST_WNRO.timestamp():
+        gps_end += GPS_WNRO_PERIOD.total_seconds()
+    return datetime.fromtimestamp(
+        gps_end + util.utc_gps_offset(gps_end), tz=timezone.utc
+    )
+
+
+SessionId = tuple[str, datetime]
+
 
 class DataCubeHeader(NamedTuple):
     """Minimal DATA-CUBE³ file header."""
@@ -245,6 +285,11 @@ class DataCubeHeader(NamedTuple):
     file_number: int
     session_start: datetime
     """Start of the recording session, UTC."""
+
+    @property
+    def session_id(self) -> SessionId:
+        """Identifies the recording session, the cube does not move within it."""
+        return self.device, self.session_start
 
     @property
     def recording_id(self) -> tuple[str, datetime, int]:

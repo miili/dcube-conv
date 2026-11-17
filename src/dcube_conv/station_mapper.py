@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import fiona
 from pydantic import (
@@ -16,9 +15,6 @@ from pydantic import (
 )
 
 from dcube_conv.model import Location
-
-if TYPE_CHECKING:
-    from dcube_conv.stations import CubeLocation
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +148,7 @@ class StationMapper(BaseModel):
 
     def load_geopackage(self, file: Path) -> None:
         logger.info("Loading GeoPackage %s", file)
+        self._features = []
         with fiona.open(file) as data:
             logger.info("Loaded %d features", len(data))
             for feature in data:
@@ -178,8 +175,10 @@ class StationMapper(BaseModel):
         station.set_parent(self)
         return station
 
-    def get_station(self, site: CubeLocation) -> Station | None:
-        distances = [feature.surface_distance_to(site) for feature in self._features]
+    def get_station(self, location: Location) -> Station | None:
+        distances = [
+            feature.surface_distance_to(location) for feature in self._features
+        ]
         min_distance = min(distances)
         if min_distance > self.distance_threshold_meters:
             return None

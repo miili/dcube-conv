@@ -14,11 +14,14 @@ def make_header(
     s_time: str = "12:43:38",
     dat_no: str = "001",
     terminator: bytes = b"\x80",
+    device: str = "903",
+    gain: int = 64,
+    sampling_rate: int = 200,
 ) -> bytes:
     header = (
-        b"\xf0GIPP_V=V3.3_10A;DEV_NO=903;E_NAME=EGER-Large-N;P_AMPL=64;CH_NUM=3;"
-        b"S_RATE=200;D_FILT=31;GPS_PO=>SIP+50+012+0000;"
-        + f"S_TIME={s_time};S_DATE={s_date};D_VOLT=3035;DAT_NO={dat_no}".encode()
+        f"\xf0GIPP_V=V3.3_10A;DEV_NO={device};E_NAME=EGER-Large-N;P_AMPL={gain};"
+        f"CH_NUM=3;S_RATE={sampling_rate};D_FILT=31;GPS_PO=>SIP+50+012+0000;"
+        f"S_TIME={s_time};S_DATE={s_date};D_VOLT=3035;DAT_NO={dat_no}".encode("latin-1")
         + terminator
         + b">XPV015.1+5008140+01236586+0042312"
     )

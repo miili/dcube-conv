@@ -1,130 +1,257 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import math
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator, DefaultDict, Iterator
+from typing import Any, AsyncIterator, ClassVar, Iterator, NamedTuple, Self
 
-from pydantic import AliasChoices, BaseModel, Field, PositiveFloat, PrivateAttr
-from pyrocko.io.datacube import coordinates_from_gps
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    PositiveFloat,
+    PrivateAttr,
+    TypeAdapter,
+    ValidationError,
+)
+from pyrocko.io.datacube import DataCubeError, get_time_infos
 from pyrocko.model import Station as PyrockoStation
 from pyrocko.model import dump_stations_yaml
+from rich.console import RenderableType
+from rich.progress import Progress
 
-from dcube_conv.model import CubeFile, CubeId, Location
+from dcube_conv.model import CubeFile, Location
 from dcube_conv.processors import ProcessorType
-from dcube_conv.station_mapper import SensorID, Station, StationMapper
-from dcube_conv.stats import Stats
+from dcube_conv.station_mapper import Station, StationMapper
+from dcube_conv.stats import Stats, StatsTable, make_progress, problem
 from dcube_conv.utils import (
-    DATETIME_MAX,
+    DataCubeHeader,
     ElevationModel,
-    datetime_now,
+    SessionId,
     get_elevation,
+    gps_end_time,
 )
-
-if TYPE_CHECKING:
-    from rich.table import Table
 
 logger = logging.getLogger(__name__)
 
-SAVE_INTERVAL = timedelta(seconds=60)
+# Files read for a GPS fix when locating a session, starting with the last one.
+MAX_LOCATE_ATTEMPTS = 8
+# Largest offset of the cube clock from GPS time at the end of a session.
+MAX_CLOCK_DRIFT = timedelta(hours=6)
+# Sessions located by an older version are located again.
+LOCATE_VERSION = 2
+
+Recordings = list[tuple[Path, DataCubeHeader]]
 
 
-class StationNotFoundError(Exception):
-    """No station of the layout is close to a cube location."""
+class DeploymentStats(Stats):
+    title: ClassVar[str] = "Deployments"
 
-
-class SitesStats(Stats):
-    n_sites: int = 0
+    n_sessions: int = 0
+    i_sessions: int = 0
+    n_cached: int = 0
+    n_no_gps: int = 0
+    n_no_station: int = 0
     n_stations: int = 0
-    n_unmatched_cubes: int = 0
+    n_layout: int = 0
 
-    def _populate_table(self, table: Table) -> None:
-        table.add_row("Sites", str(self.n_sites))
-        table.add_row("Sites not found", f"[red]{self.n_unmatched_cubes}")
-        table.add_row("Stations", str(self.n_stations))
-        table.add_row("Stations not found", f"[red]{self.n_sites - self.n_stations}")
+    n_files_assigned: int = 0
+    n_files_no_station: int = 0
+    n_files_excluded: int = 0
+    n_files_off_site: int = 0
+
+    _bar: Progress = PrivateAttr(default_factory=make_progress)
+
+    def model_post_init(self, __context: Any) -> None:
+        super().model_post_init(__context)
+        self._position = 1
+        self._task = self._bar.add_task("Locating", total=None, detail="")
+
+    def progress_bar(self) -> RenderableType | None:
+        if not self.n_sessions:
+            return None
+        self._bar.update(
+            self._task,
+            total=self.n_sessions,
+            completed=self.i_sessions,
+            detail=f"{self.i_sessions:,}/{self.n_sessions:,} sessions",
+        )
+        return self._bar
+
+    def _populate(self, table: StatsTable) -> None:
+        table.row(
+            "sessions",
+            self.n_sessions,
+            detail=f"{self.n_cached:,} from state"
+            f" · {self.i_sessions - self.n_cached:,} located from GPS"
+            f" · {problem(self.n_no_gps, 'no GPS fix')}",
+        )
+        table.row(
+            "stations",
+            self.n_stations,
+            detail=f"of {self.n_layout:,} in layout"
+            f" · {problem(self.n_no_station, 'sessions without station')}",
+        )
+        table.row(
+            "files",
+            self.n_files_assigned,
+            "bold green",
+            detail=f"assigned · {problem(self.n_files_no_station, 'without station')}"
+            f" · {self.n_files_excluded:,} excluded"
+            f" · {problem(self.n_files_off_site, 'off site')}",
+        )
 
 
-class CubeLocation(Location):
-    # Old state files use `location`.
-    location_code: str = Field(
-        default="", validation_alias=AliasChoices("location_code", "location")
-    )
+class Deployment(Location):
+    """A recording session of a cube, the cube stays at one place."""
+
     cube_id: str
-    sampling_rate: PositiveFloat
-
+    session_start: datetime
     start_time: datetime
     end_time: datetime
-
+    sampling_rate: PositiveFloat
+    gain: int
+    n_files: int
     station: Station | None = None
+    location_code: str = ""
+    locate_version: int = 1
+    """Version 1 took the session end from the drifting cube clock."""
 
     @property
-    def station_name(self) -> str:
-        name = self.station.code if self.station else ""
-        return re.sub(r"[^a-zA-Z0-9]", "", name)
+    def session_id(self) -> SessionId:
+        return self.cube_id, self.session_start
+
+    @property
+    def station_code(self) -> str:
+        """Station code reduced to the characters allowed in miniSEED."""
+        code = self.station.code if self.station else ""
+        return re.sub(r"[^a-zA-Z0-9]", "", code)
 
     @property
     def wkt_geom(self) -> str:
         return f"POINT Z({self.lon} {self.lat} {self.elevation})"
 
-    def set_station(self, station: Station) -> None:
-        self.station = station
-
-    @classmethod
-    async def from_datacube_file(cls, datacube: CubeFile) -> CubeLocation | None:
-        lat, lon, elevation = await asyncio.to_thread(
-            coordinates_from_gps, datacube.gps_tags
-        )
-        if math.isnan(lat) or math.isnan(lon) or lat == 0.0 or lon == 0.0:
-            logger.error(
-                "No GPS coordinates found for cube %s - %s.",
-                datacube.cube_id,
-                datacube.start_time,
-            )
-            return None
-        return cls(
-            cube_id=datacube.cube_id,
-            lat=lat,
-            lon=lon,
-            elevation=elevation,
-            sampling_rate=datacube.sampling_rate,
-            start_time=datacube.start_time,
-            end_time=datacube.end_time,
-        )
-
-    def update_start_time(self, start_time: datetime) -> None:
-        self.start_time = min(self.start_time, start_time)
-
-    def as_pyrocko_station(self, network: str = "") -> PyrockoStation:
-        return PyrockoStation(
-            network=network,
-            station=self.station_name or self.cube_id,
-            location=self.location_code,
-            lat=self.lat,
-            lon=self.lon,
-            elevation=self.elevation,
-        )
+    def extend(self, cube: CubeFile) -> None:
+        """Extend the time span to the GPS corrected times of a file."""
+        self.start_time = min(self.start_time, cube.start_time)
+        self.end_time = max(self.end_time, cube.end_time)
 
     def has_valid_elevation(self) -> bool:
-        return not (self.elevation == -999999.0 or self.elevation == 0.0)
+        return self.elevation not in (-999999.0, 0.0)
 
     async def query_elevation(self, model: ElevationModel = "aster30m") -> None:
         self.elevation = await get_elevation(self.lat, self.lon, model)
         logger.info("New elevation for cube %s is %.1f m", self.cube_id, self.elevation)
 
 
-class CubeLocations(BaseModel):
-    network: str = Field(default="DC", max_length=2, pattern=r"[a-zA-Z0-9]")
-    sites: DefaultDict[CubeId, list[CubeLocation]] = Field(
-        default_factory=lambda: defaultdict(list)
+DEPLOYMENTS = TypeAdapter(list[Deployment])
+
+
+def locate_session(recordings: Recordings) -> Deployment | None:
+    """Locate a recording session from the GPS tags of its files.
+
+    The last file is read first, it also gives the end of the session.
+
+    Args:
+        recordings (Recordings): The files of the session, sorted by file number.
+
+    Returns:
+        Deployment | None: The deployment, None without a GPS fix.
+    """
+    first = recordings[0][1]
+    last = recordings[-1][1]
+    end_time = last.start_time + timedelta(days=1)
+
+    step = max(1, len(recordings) // MAX_LOCATE_ATTEMPTS)
+    candidates = recordings[::-1][::step][:MAX_LOCATE_ATTEMPTS]
+    location = None
+    for file, header in candidates:
+        try:
+            _, gps_tags, nsamples = get_time_infos(str(file))
+        except (DataCubeError, OSError) as exc:
+            logger.debug("Cannot read GPS of %s: %s", file, exc)
+            continue
+        if header is last:
+            end_time = header.start_time + timedelta(
+                seconds=(nsamples - 1) / header.sampling_rate
+            )
+            gps_end = gps_end_time(gps_tags, nsamples, header.sampling_rate)
+            if gps_end and abs(gps_end - end_time) < MAX_CLOCK_DRIFT:
+                end_time = gps_end
+            else:
+                logger.warning(
+                    "No GPS time for the end of session %s of cube %s,"
+                    " using the cube clock",
+                    header.session_start,
+                    header.device,
+                )
+        if location := Location.from_gps_tags(gps_tags):
+            break
+    if location is None:
+        return None
+
+    for setting in ("sampling_rate", "gain"):
+        values = {getattr(header, setting) for _, header in recordings}
+        if len(values) > 1:
+            logger.warning(
+                "Session %s of cube %s changes %s: %s",
+                first.session_start,
+                first.device,
+                setting,
+                sorted(values),
+            )
+    return Deployment(
+        cube_id=first.device,
+        session_start=first.session_start,
+        start_time=first.start_time,
+        end_time=end_time,
+        sampling_rate=first.sampling_rate,
+        gain=first.gain,
+        n_files=len(recordings),
+        locate_version=LOCATE_VERSION,
+        **location.model_dump(),
     )
+
+
+class StationDeployments(NamedTuple):
+    """A station of the layout and the cube deployments recording it."""
+
+    station: Station
+    deployments: list[Deployment]
+
+    @property
+    def code(self) -> str:
+        return self.deployments[0].station_code
+
+    @property
+    def start_time(self) -> datetime:
+        return min(d.start_time for d in self.deployments)
+
+    @property
+    def end_time(self) -> datetime:
+        return max(d.end_time for d in self.deployments)
+
+
+class Deployments(BaseModel):
+    """Assigns datacube files to stations through their recording sessions.
+
+    A cube does not move within a recording session, so each session is one
+    deployment. It is located once from GPS and matched to the nearest station
+    of the layout.
+    """
+
+    network: str = Field(default="DC", max_length=2, pattern=r"^[a-zA-Z0-9]+$")
     elevation_model: ElevationModel = Field(default="aster30m")
 
-    post_processors: dict[SensorID, list[ProcessorType]] = {}
+    post_processors: dict[str, list[ProcessorType]] = Field(
+        default_factory=dict,
+        description="Processors per station code.",
+    )
     # Old configs use `station_blacklist`.
     exclude_stations: set[str] = Field(
         default_factory=set,
@@ -132,252 +259,239 @@ class CubeLocations(BaseModel):
     )
 
     mapper: StationMapper = Field(default_factory=StationMapper)
-    no_site_info: set[CubeId] = Field(default_factory=set)
 
-    _dump_path: Path | None = PrivateAttr(None)
-    _last_save: datetime = PrivateAttr(default_factory=datetime_now)
-    _stats: SitesStats = PrivateAttr(default_factory=SitesStats)
+    _deployments: dict[SessionId, Deployment] = PrivateAttr(default_factory=dict)
+    _state_file: Path | None = PrivateAttr(None)
+    _stats: DeploymentStats = PrivateAttr(default_factory=DeploymentStats)
 
-    async def prepare(self) -> None:
-        logger.info("Preparing CubeSites")
+    async def prepare(self, sessions: dict[SessionId, Recordings]) -> None:
+        """Locate new recording sessions and match all to stations.
+
+        Args:
+            sessions (dict[SessionId, Recordings]): Files per recording session.
+        """
+        stats = self._stats
         self.mapper.prepare()
+        stats.n_sessions = len(sessions)
+        stats.n_layout = len(self.mapper._features)
 
-    @property
-    def n_sites(self) -> int:
-        return sum(len(sites) for sites in self.sites.values())
-
-    @property
-    def n_cubes(self) -> int:
-        return len(self.sites)
-
-    def add_site(self, site: CubeLocation) -> None:
-        existing_sites = self.sites.get(site.cube_id, [])
-        self.write_site_csv(site, self._dump_path.with_suffix(".sites.csv"))
-
-        for existing_site in existing_sites:
-            if existing_site.is_close(site):
-                existing_site.start_time = min(
-                    site.start_time,
-                    existing_site.start_time,
+        async def locate(recordings: Recordings) -> None:
+            deployment = await asyncio.to_thread(locate_session, recordings)
+            stats.i_sessions += 1
+            if deployment is None:
+                stats.n_no_gps += 1
+                header = recordings[0][1]
+                logger.warning(
+                    "No GPS fix in session %s of cube %s, skipping %d files",
+                    header.session_start,
+                    header.device,
+                    len(recordings),
                 )
-                existing_site.end_time = max(
-                    site.end_time,
-                    existing_site.end_time,
-                )
-                # Only the time span grew, saved latest at the end of the run.
-                self.save(throttle=True)
                 return
+            # Keep an elevation filled online when the GPS gives none.
+            known = self._deployments.get(deployment.session_id)
+            if (
+                known
+                and known.has_valid_elevation()
+                and not deployment.has_valid_elevation()
+            ):
+                deployment.elevation = known.elevation
+            self._deployments[deployment.session_id] = deployment
 
-        station = self.mapper.get_station(site)
-        if not station:
-            self.write_site_csv(site, self._dump_path.with_suffix(".bad_sites.csv"))
-            raise StationNotFoundError(f"No station found for {site}")
+        new_sessions = []
+        for session_id, recordings in sessions.items():
+            known = self._deployments.get(session_id)
+            if (
+                known
+                and known.n_files == len(recordings)
+                and known.locate_version == LOCATE_VERSION
+            ):
+                stats.n_cached += 1
+                stats.i_sessions += 1
+            else:
+                new_sessions.append(recordings)
+        await asyncio.gather(*(locate(recordings) for recordings in new_sessions))
 
-        site.set_station(station)
-        self._stats.n_stations += 1
-
-        self.sites[site.cube_id].append(site)
-        self._stats.n_sites += 1
+        # Match all, the layout may have changed since the last run.
+        for deployment in self._deployments.values():
+            deployment.station = self.mapper.get_station(deployment)
+            if deployment.station is None:
+                stats.n_no_station += 1
+                logger.warning(
+                    "No station within %.0f m of cube %s at %.5f, %.5f (%s)",
+                    self.mapper.distance_threshold_meters,
+                    deployment.cube_id,
+                    deployment.lat,
+                    deployment.lon,
+                    deployment.session_start,
+                )
+        stats.n_stations = len(
+            {d.station_code for d in self._deployments.values() if d.station}
+        )
         self.save()
 
-    def get_site(self, datacube: CubeFile) -> CubeLocation | None:
-        if sites := self.sites.get(datacube.cube_id, None):
-            for site in sorted(sites, key=lambda s: s.start_time, reverse=True):
-                if site.start_time <= datacube.start_time <= site.end_time:
-                    return site
-        logging.error(
-            "No site found for %s, %s",
-            datacube.cube_id,
-            datacube.start_time,
+    def get(self, cube: CubeFile) -> Deployment | None:
+        return self._deployments.get(cube.header.session_id)
+
+    def iter_deployments(self) -> Iterator[Deployment]:
+        yield from sorted(
+            self._deployments.values(), key=lambda d: (d.cube_id, d.start_time)
         )
-        self._stats.n_unmatched_cubes += 1
-        self.no_site_info.add(datacube.cube_id)
-        return None
 
-    def iter_sites(self) -> Iterator[CubeLocation]:
-        for sites in self.sites.values():
-            for site in sites:
-                yield site
+    def iter_stations(self) -> Iterator[StationDeployments]:
+        """Stations of the layout with their deployments, sorted by time."""
+        by_code: defaultdict[str, list[Deployment]] = defaultdict(list)
+        for deployment in sorted(
+            self._deployments.values(), key=lambda d: d.start_time
+        ):
+            if deployment.station:
+                by_code[deployment.station_code].append(deployment)
 
-    def iter_stations(self) -> Iterator[CubeLocation]:
-        sites = {}
-
-        for site in self.iter_sites():
-            if site.station is None:
-                logger.warning(
-                    "Skipping: No station for cube %s (%f, %f)",
-                    site.cube_id,
-                    site.lat,
-                    site.lon,
-                )
-                continue
-
-            if site.station_name not in sites:
-                sites[site.station_name] = site
-                continue
-
-            existing_site = sites[site.station_name]
-            if site.distance_to(existing_site) > 25.0:
-                logger.warning(
-                    "Site %s is more than 25 m away from existing site %s",
-                    site,
-                    existing_site,
-                )
-                continue
-            existing_site.start_time = min(existing_site.start_time, site.start_time)
-            existing_site.end_time = max(existing_site.end_time, site.end_time)
-
-        yield from sites.values()
-
-    def fill_endtimes(self, end_time: datetime = DATETIME_MAX) -> None:
-        logger.info("Filling end times of sites")
-        for sites in self.sites.values():
-            sorted_sites = sorted(sites, key=lambda s: s.start_time)
-            for i_site, site in enumerate(sorted_sites):
-                if site.end_time:
-                    continue
-                if i_site + 1 < len(sorted_sites):
-                    site.end_time = sorted_sites[i_site + 1].start_time
-                else:
-                    site.end_time = end_time
-
-    async def post_process_datacube(
-        self,
-        cube: CubeFile,
-        site: CubeLocation,
-    ) -> None:
-        for processor in self.post_processors.get(site.station_name, []):
-            await processor.process(cube)
+        for code, deployments in sorted(by_code.items()):
+            for previous, deployment in pairwise(deployments):
+                if deployment.start_time < previous.end_time:
+                    logger.warning(
+                        "Overlapping deployments at %s: cube %s until %s,"
+                        " cube %s from %s",
+                        code,
+                        previous.cube_id,
+                        previous.end_time,
+                        deployment.cube_id,
+                        deployment.start_time,
+                    )
+            yield StationDeployments(deployments[-1].station, deployments)
 
     async def process_datacubes(
         self,
         cubes: AsyncIterator[CubeFile],
     ) -> AsyncIterator[CubeFile]:
-        logger.info("Processing datacubes")
+        stats = self._stats
         try:
             async for cube in cubes:
-                new_site = await CubeLocation.from_datacube_file(cube)
-                if new_site:
-                    try:
-                        self.add_site(new_site)
-                    except StationNotFoundError as e:
-                        logger.error("Failed to add site: %s from %s", e, cube.path)
-                        continue
-                site = self.get_site(cube)
-                if not site:
-                    logger.debug(
-                        "No site found for cube %s from %s",
-                        cube.cube_id,
-                        cube.path,
-                    )
+                deployment = self.get(cube)
+                if deployment is None or deployment.station is None:
+                    stats.n_files_no_station += 1
+                    logger.debug("No station for %s", cube.path)
                     continue
-                if not site.station:
-                    logger.debug(
-                        "No station name for cube %s from %s",
-                        cube.cube_id,
-                        cube.path,
-                    )
+                code = deployment.station_code
+                if code in self.exclude_stations:
+                    stats.n_files_excluded += 1
                     continue
+                if cube.location:
+                    distance = cube.location.surface_distance_to(deployment)
+                    if distance > self.mapper.distance_threshold_meters:
+                        stats.n_files_off_site += 1
+                        logger.warning(
+                            "%s is %.0f m away from its deployment at %s",
+                            cube.path,
+                            distance,
+                            code,
+                        )
 
-                cube.set_nsl(self.network, site.station_name, site.location_code)
-                if site.station_name in self.exclude_stations:
-                    logger.info("Skipping blacklisted station %s", site.station_name)
-                    continue
-                if site.station.sensor == "geophone" and cube.header.gain != 64:
-                    logger.warning("wrong gain in %s, expected 64", cube.path)
-                for old, new in site.station.get_channel_map().items():
+                cube.deployment = deployment
+                deployment.extend(cube)
+                cube.set_nsl(self.network, code, deployment.location_code)
+                for old, new in deployment.station.get_channel_map().items():
                     cube.rename_channels(old, new)
-                await self.post_process_datacube(cube, site)
+                for processor in self.post_processors.get(code, []):
+                    await processor.process(cube)
 
+                stats.n_files_assigned += 1
                 yield cube
-
-            self.fill_endtimes()
         finally:
             self.save(views=True)
 
     def dump_csv(self, file: Path) -> None:
-        logger.debug("Dumping CSV stations to %s", file)
+        logger.debug("Dumping CSV deployments to %s", file)
         with file.open("w") as f:
             f.write(
-                "cube_id,location,lat,lon,elevation,depth,start_time,station_name,WKT_geom\n"
+                "cube_id,session_start,start_time,end_time,station,location,"
+                "lat,lon,elevation,sampling_rate,gain,n_files,WKT_geom\n"
             )
-            for site in self.iter_sites():
+            for d in self.iter_deployments():
                 f.write(
-                    f"{site.cube_id},{site.location_code},{site.lat},{site.lon},"
-                    f"{site.elevation},{site.depth},{site.start_time},"
-                    f"{site.station_name},{site.wkt_geom}\n"
+                    f"{d.cube_id},{d.session_start},{d.start_time},{d.end_time},"
+                    f"{d.station_code},{d.location_code},{d.lat},{d.lon},"
+                    f"{d.elevation},{d.sampling_rate},{d.gain},{d.n_files},"
+                    f"{d.wkt_geom}\n"
                 )
-
-    def write_site_csv(self, site: CubeLocation, file: Path) -> None:
-        if not file.exists():
-            file.write_text(
-                "cube_id,location,lat,lon,elevation,depth,start_time,station_name,WKT_geom\n"
-            )
-        with file.open("a") as f:
-            f.write(
-                f"{site.cube_id},{site.location_code},{site.lat},{site.lon},"
-                f"{site.elevation},{site.depth},{site.start_time},"
-                f"{site.station_name},{site.wkt_geom}\n"
-            )
 
     def dump_pyrocko_yaml(self, file: Path) -> None:
         logger.debug("Dumping Pyrocko stations to %s", file)
         stations = []
-        for site in self.iter_sites():
-            stations.append(site.as_pyrocko_station(self.network))
+        for station in self.iter_stations():
+            latest = station.deployments[-1]
+            stations.append(
+                PyrockoStation(
+                    network=self.network,
+                    station=station.code,
+                    location=latest.location_code,
+                    lat=latest.lat,
+                    lon=latest.lon,
+                    elevation=latest.elevation,
+                )
+            )
         dump_stations_yaml(stations, str(file))
 
-    def save(self, *, views: bool = False, throttle: bool = False) -> None:
-        """Save the state atomically.
+    def save(self, *, views: bool = False) -> None:
+        """Save the deployments atomically.
 
         Args:
             views (bool, optional): Also write the derived CSV and Pyrocko YAML
                 files. Defaults to False.
-            throttle (bool, optional): Skip saving if the last save is less
-                than `SAVE_INTERVAL` ago. Defaults to False.
         """
-        if not self._dump_path:
-            logger.warning("No dump path set, not saving.")
+        if not self._state_file:
             return
-        now = datetime_now()
-        if throttle and now - self._last_save < SAVE_INTERVAL:
-            return
-
-        tmp_file = self._dump_path.with_suffix(".tmp")
-        tmp_file.write_text(self.model_dump_json(indent=2))
-        tmp_file.replace(self._dump_path)
-        self._last_save = now
-
+        tmp_file = self._state_file.with_suffix(".tmp")
+        tmp_file.write_bytes(
+            DEPLOYMENTS.dump_json(list(self.iter_deployments()), indent=2)
+        )
+        tmp_file.replace(self._state_file)
         if views:
-            self.dump_csv(self._dump_path.with_suffix(".csv"))
-            self.dump_pyrocko_yaml(self._dump_path.with_suffix(".yaml"))
+            self.dump_csv(self._state_file.with_suffix(".csv"))
+            self.dump_pyrocko_yaml(self._state_file.with_suffix(".yaml"))
+
+    def load_state(self, file: Path) -> None:
+        """Load located deployments of earlier runs and save to this file."""
+        self._state_file = file
+        if not file.exists():
+            return
+        try:
+            deployments = DEPLOYMENTS.validate_json(file.read_bytes())
+        except ValidationError as exc:
+            logger.warning("Ignoring incompatible state %s: %s", file, exc)
+            return
+        for deployment in deployments:
+            if deployment.station:
+                deployment.station.set_parent(self.mapper)
+            self._deployments[deployment.session_id] = deployment
+        logger.info("Loaded %d deployments from %s", len(deployments), file)
+
+    @classmethod
+    def from_run_config(cls, file: Path) -> Self:
+        """Load the station configuration and deployments of a conversion run.
+
+        Args:
+            file (Path): The conversion config, e.g. run.json.
+        """
+        config = json.loads(file.read_text())
+        deployments = cls.model_validate(config.get("stations", {}))
+        deployments.load_state(state_file(file))
+        return deployments
 
     async def fill_elevations(self) -> None:
         """Fill missing elevations by querying them from online service."""
-        n_missing = len([s for s in self.iter_sites() if not s.has_valid_elevation()])
+        missing = [d for d in self.iter_deployments() if not d.has_valid_elevation()]
         logger.info(
-            "Filling missing elevations for %d sites from %s",
-            n_missing,
+            "Filling missing elevations for %d deployments from %s",
+            len(missing),
             self.elevation_model,
         )
-        for site in self.iter_sites():
-            if not site.has_valid_elevation():
-                await site.query_elevation(self.elevation_model)
+        for deployment in missing:
+            await deployment.query_elevation(self.elevation_model)
         self.save(views=True)
 
-    @classmethod
-    def load(cls, file: Path):
-        sites = cls.model_validate_json(file.read_bytes())
-        sites._dump_path = file
-        logger.info(
-            "loaded %d sites and %d cubes from %s",
-            sites.n_sites,
-            sites.n_cubes,
-            file,
-        )
 
-        for site in sites.iter_sites():
-            if site.station and sites.mapper:
-                site.station.set_parent(sites.mapper)
-
-        return sites
+def state_file(config_file: Path) -> Path:
+    """State file of a conversion run, next to its config."""
+    return config_file.with_name(f"{config_file.stem}.deployments.json")

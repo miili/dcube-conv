@@ -36,6 +36,17 @@ def main():
         help="Path to configuration file.",
     )
 
+    locate = subparsers.add_parser(
+        "locate",
+        help="Locate the recording sessions and update the deployments,"
+        " without converting data",
+    )
+    locate.add_argument(
+        "input_path",
+        type=Path,
+        help="Path to configuration file.",
+    )
+
     subparsers.add_parser(
         "init",
         help="Initialize a new DCube convert project and print to stdout",
@@ -72,9 +83,9 @@ def main():
         help="Path to generated config file.",
     )
     xml_create.add_argument(
-        "input_stations",
+        "run_config",
         type=Path,
-        help="Path to <run>.station.json file.",
+        help="Path to the conversion config, its <run>.deployments.json is used.",
     )
 
     plot = subparsers.add_parser(
@@ -82,9 +93,9 @@ def main():
         help="Plot station coverage",
     )
     plot.add_argument(
-        "input_path",
+        "run_config",
         type=Path,
-        help="Path to <run>.station.json file.",
+        help="Path to the conversion config, its <run>.deployments.json is used.",
     )
 
     args = parser.parse_args()
@@ -102,6 +113,12 @@ def main():
         logging.root.addHandler(file_logger)
         asyncio.run(converter.convert(), debug=loop_debug)
 
+    elif args.command == "locate":
+        from dcube_conv.convert import Converter
+
+        converter = Converter.load(args.input_path)
+        asyncio.run(converter.locate(), debug=loop_debug)
+
     elif args.command == "init":
         from dcube_conv.convert import Converter
 
@@ -113,21 +130,22 @@ def main():
 
             print_json(StationXML().model_dump_json(indent=2))
         elif args.xml_command == "create":
-            from dcube_conv.stations import CubeLocations
+            from dcube_conv.stations import Deployments
             from dcube_conv.stationxml import StationXML
 
-            sites = CubeLocations.load(args.input_stations)
+            deployments = Deployments.from_run_config(args.run_config)
             if args.fill_elevations:
-                asyncio.run(sites.fill_elevations())
+                asyncio.run(deployments.fill_elevations())
             stationxml = StationXML.model_validate_json(args.input_config.read_bytes())
-            stationxml.dump_stationxml(sites, args.input_config.with_suffix(".xml"))
+            stationxml.dump_stationxml(
+                deployments, args.input_config.with_suffix(".xml")
+            )
 
     elif args.command == "plot":
         from dcube_conv.plot import plot_cube_coverage
-        from dcube_conv.stations import CubeLocations
+        from dcube_conv.stations import Deployments
 
-        sites = CubeLocations.load(args.input_path)
-        plot_cube_coverage(sites)
+        plot_cube_coverage(Deployments.from_run_config(args.run_config))
 
     else:
         parser.print_help()

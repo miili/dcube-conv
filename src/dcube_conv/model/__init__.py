@@ -8,12 +8,14 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 from weakref import WeakValueDictionary
 
+import numpy as np
 import pyrocko.orthodrome as od
 from pydantic import BaseModel
 from pyrocko.io import save
+from pyrocko.io.datacube import GPSTags
 from pyrocko.trace import Trace
 
 from dcube_conv.utils import (
@@ -22,6 +24,9 @@ from dcube_conv.utils import (
     detect_datacube,
     load_datacube,
 )
+
+if TYPE_CHECKING:
+    from dcube_conv.stations import Deployment
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +56,12 @@ class CubeFile:
     header: DataCubeHeader
     traces: list[Trace]
     gps_tags: Any
+    location: Location | None = None
+    """GPS position of this file, None without a GPS fix."""
+    size: int = 0
+    """File size in bytes."""
+    deployment: Deployment | None = None
+    """Set when the file is assigned to a deployment."""
 
     @property
     def cube_id(self) -> CubeId:
@@ -81,7 +92,14 @@ class CubeFile:
         if not traces:
             logger.warning("No traces in %s", file)
             return None
-        return cls(path=file, header=header, traces=traces, gps_tags=gps_tags)
+        return cls(
+            path=file,
+            header=header,
+            traces=traces,
+            gps_tags=gps_tags,
+            location=Location.from_gps_tags(gps_tags),
+            size=file.stat().st_size,
+        )
 
     def set_nsl(self, network: str, station: str, location: str) -> None:
         for trace in self.traces:
@@ -145,6 +163,30 @@ class Location(BaseModel):
     elevation: float = 0.0
     depth: float = 0.0
 
+    @classmethod
+    def from_gps_tags(cls, gps_tags: Any) -> Location | None:
+        """Median position of the GPS tags with a fix.
+
+        Args:
+            gps_tags (Any): Raw GPS tags of a DATA-CUBE³ file.
+
+        Returns:
+            Location | None: The position, None without a GPS fix.
+        """
+        if gps_tags is None:
+            return None
+        tags = GPSTags.from_tuple(gps_tags)
+        fix = tags.fix > 0
+        if not fix.any():
+            return None
+        lat = float(np.median(tags.latitudes[fix]))
+        lon = float(np.median(tags.longitudes[fix]))
+        if lat == 0.0 and lon == 0.0:
+            return None
+        return Location(
+            lat=lat, lon=lon, elevation=float(np.median(tags.elevations[fix]))
+        )
+
     @property
     def effective_elevation(self) -> float:
         return self.elevation - self.depth
@@ -172,7 +214,9 @@ class Location(BaseModel):
             float: The distance in [m].
         """
         sx, sy, sz = od.geodetic_to_ecef(self.lat, self.lon, self.effective_elevation)
-        ox, oy, oz = od.geodetic_to_ecef(self.lat, self.lon, other.effective_elevation)
+        ox, oy, oz = od.geodetic_to_ecef(
+            other.lat, other.lon, other.effective_elevation
+        )
 
         return math.sqrt((sx - ox) ** 2 + (sy - oy) ** 2 + (sz - oz) ** 2)
 
